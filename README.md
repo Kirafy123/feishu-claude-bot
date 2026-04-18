@@ -1,6 +1,6 @@
 # Claude Code 飞书机器人
 
-将 Claude Code 接入飞书，实现本地电脑助手功能。
+将 Claude Code 接入飞书，实现本地电脑助手功能，可以通过飞书控制本地电脑部署的claude code处理任务。
 
 ## 核心特性
 
