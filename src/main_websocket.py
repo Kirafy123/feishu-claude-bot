@@ -141,7 +141,9 @@ class MainSession:
     persistent_client: Optional[PersistentClient] = field(default=None, repr=False)
 
     def __post_init__(self):
-        self.log_file = f"D:\\remote-claude-code\\logs\\claude_session_{self.chat_id}.log"
+        _logs_dir = str(Path(__file__).parent.parent / "logs")
+        os.makedirs(_logs_dir, exist_ok=True)
+        self.log_file = os.path.join(_logs_dir, f"claude_session_{self.chat_id}.log")
 
     def log_message(self, role: str, text: str, session_tag: str = "main"):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -585,7 +587,7 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         if text.startswith("/setworkspace "):
             workspace_path = text.split(" ", 1)[1].strip()
             if not workspace_path:
-                send_message(chat_id, "❌ 请指定工作空间路径，如：/setworkspace /Users/tin/my_project", get_token())
+                send_message(chat_id, "❌ 请指定工作空间路径，如：/setworkspace /path/to/project", get_token())
                 return
 
             # 验证路径是否存在
