@@ -300,6 +300,10 @@ def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: st
     """向指定会话分发消息"""
     if target == "main":
         main = _main_sessions[chat_id]
+        # 检测崩溃：busy=True 但线程已死亡 → 重置状态
+        if main.busy and main.thread and not main.thread.is_alive():
+            main.busy = False
+            main.thread = None
         main.queue.put((text, message_id, chat_type))
         thread_alive = main.thread is not None and main.thread.is_alive()
         logger.info(f"[{chat_id[:8]}...] dispatch main: thread_alive={thread_alive}, queue_size={main.queue.qsize()}")
@@ -311,6 +315,10 @@ def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: st
     elif target == "parallel":
         with _global_lock:
             parallel = list(_parallel_sessions.values())[0]
+            # 检测崩溃
+            if parallel.busy and parallel.thread and not parallel.thread.is_alive():
+                parallel.busy = False
+                parallel.thread = None
         parallel.queue.put((text, message_id, chat_type))
         if parallel.thread is None or not parallel.thread.is_alive():
             parallel.busy = True
@@ -653,10 +661,11 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             else:
                 logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
                 with _global_lock:
-                    # 同步并行会话 busy 状态
+                    # 检测并行会话崩溃：busy=True 但线程已死 → 重置
                     for ps in list(_parallel_sessions.values()):
-                        if ps.parent_chat_id == chat_id:
-                            _sync_session_busy(ps)
+                        if ps.parent_chat_id == chat_id and ps.busy and ps.thread and not ps.thread.is_alive():
+                            ps.busy = False
+                            ps.thread = None
                     idle_parallel = None
                     for ps in _parallel_sessions.values():
                         if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
@@ -773,9 +782,6 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
         main = _main_sessions[chat_id]
 
-        # 同步 busy 状态（防止线程崩溃导致 busy 卡住）
-        _sync_session_busy(main)
-
         # ========== 分发逻辑 ==========
         queue_size = _waiting_queue[chat_id].qsize()
         logger.info(f"[{chat_id[:8]}...] 分发检查: busy={main.busy}, queue_empty={main.queue.empty()}, waiting_size={queue_size}")
@@ -801,10 +807,11 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             # 主会话忙，检查并行会话
             logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
             with _global_lock:
-                # 同步并行会话 busy 状态
+                # 检测并行会话崩溃：busy=True 但线程已死 → 重置
                 for ps in list(_parallel_sessions.values()):
-                    if ps.parent_chat_id == chat_id:
-                        _sync_session_busy(ps)
+                    if ps.parent_chat_id == chat_id and ps.busy and ps.thread and not ps.thread.is_alive():
+                        ps.busy = False
+                        ps.thread = None
                 idle_parallel = None
                 for ps in _parallel_sessions.values():
                     if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
