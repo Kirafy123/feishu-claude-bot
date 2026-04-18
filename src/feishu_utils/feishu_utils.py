@@ -139,6 +139,76 @@ def download_file_message(message_id: str, file_key: str, save_path: str, access
         raise Exception(f'下载文件失败: {res.status_code}, {res.text}')
 
 
+def upload_file_to_feishu(file_path: str, access_token=None, timeout: int = 120) -> dict:
+    """
+    上传本地文件到飞书 IM，返回 file_key。
+    限制：≤30MB，超时 120 秒。
+    返回格式: {"success": True, "file_key": "xxx"} 或 {"success": False, "error": "xxx"}
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    # 检查文件大小
+    file_size = os.path.getsize(file_path)
+    max_size = 30 * 1024 * 1024  # 30MB
+    if file_size > max_size:
+        return {"success": False, "error": f"文件过大（{file_size / 1024 / 1024:.1f}MB > 30MB）"}
+
+    url = 'https://open.feishu.cn/open-apis/im/v1/files'
+    headers = get_headers(access_token)
+
+    file_name = os.path.basename(file_path)
+    with open(file_path, 'rb') as f:
+        files = {
+            'file': (file_name, f),
+        }
+        data = {
+            'file_type': 'stream',
+            'file_name': file_name,
+        }
+        try:
+            res = requests.post(url, headers={'Authorization': headers['Authorization']}, data=data, files=files, timeout=timeout)
+            res_json = res.json()
+            if res_json.get('code') == 0:
+                return {"success": True, "file_key": res_json['data']['file_key']}
+            else:
+                return {"success": False, "error": res_json.get('msg', '上传失败')}
+        except requests.exceptions.Timeout:
+            return {"success": False, "error": "上传超时（120 秒）"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+def send_file_message(receive_id: str, file_key: str, file_name: str, access_token=None, chat_type: str = "chat") -> dict:
+    """发送文件消息到飞书"""
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = 'https://open.feishu.cn/open-apis/im/v1/messages'
+    param = {'receive_id_type': 'chat_id'}
+
+    content = json.dumps({"file_key": file_key, "file_name": file_name}, ensure_ascii=False)
+    body = {
+        'receive_id': receive_id,
+        'msg_type': 'file',
+        'content': content,
+    }
+    try:
+        res = requests.post(url, headers=get_headers(access_token), json=body, params=param, timeout=30)
+        return res.json()
+    except Exception as e:
+        return {"code": -1, "msg": str(e)}
+
+
+def zip_folder(folder_path: str, output_path: str = None) -> str:
+    """将文件夹压缩为 zip，返回 zip 文件路径"""
+    import shutil
+    if output_path is None:
+        output_path = folder_path + '.zip'
+    shutil.make_archive(folder_path, 'zip', folder_path)
+    return output_path + '.zip' if not output_path.endswith('.zip') else output_path
+
+
 def update_message(message_id, text, access_token=None):
     """编辑已发送的消息内容（仅限卡片消息）"""
     if access_token is None:

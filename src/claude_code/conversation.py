@@ -78,7 +78,7 @@ class ConversationClient:
         self,
         session_id: str = None,
         allowed_tools: list[str] = None,
-        permission_mode: str = "acceptEdits",
+        permission_mode: str = "bypassPermissions",
         system_prompt: str = None,
         cwd: str = None,
     ):
@@ -208,7 +208,7 @@ class PersistentClient:
         cwd: str = None,
         idle_timeout: int = 1920,
         allowed_tools: list[str] = None,
-        permission_mode: str = "acceptEdits",
+        permission_mode: str = "bypassPermissions",
         system_prompt: str = None,
     ):
         self.session_id = session_id

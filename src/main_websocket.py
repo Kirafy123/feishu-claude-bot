@@ -30,7 +30,10 @@ from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync, PersistentClient
-from src.feishu_utils.feishu_utils import send_message, reply_message, update_card_message, send_card_message, download_file_message
+from src.feishu_utils.feishu_utils import (
+    send_message, reply_message, update_card_message, send_card_message,
+    download_file_message, upload_file_to_feishu, send_file_message, zip_folder
+)
 from src.data_base_utils import get_session, save_session, get_workspace, save_workspace
 
 APP_ID = os.getenv("APP_ID")
@@ -296,6 +299,60 @@ if hasattr(signal, 'SIGTERM'):
 signal.signal(signal.SIGINT, _handle_signal)
 
 
+# ---------- 文件上传回传 ----------
+
+def _parse_file_paths(text: str) -> list[str]:
+    """从 Claude 回复中提取文件/文件夹路径。
+
+    匹配格式：
+    - Windows: D:\\xxx\\file.html, C:\\path\\to\\folder\\
+    - Unix: /home/user/file.txt
+    - 相对路径（仅当明确以 ./ 或 ../ 开头）
+    - 排除常见非路径文本（URL、JSON 键名等）
+    """
+    paths = []
+    # 匹配 Windows 路径（最常见场景）和 Unix 绝对路径
+    path_pattern = re.compile(
+        r'(?:^|(?<=\s)|(?<=\n)|(?<=[:：]))'  # 空白、换行、冒号后
+        r'([A-Za-z]:\\[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)'
+    )
+    for match in path_pattern.finditer(text):
+        p = match.group(1).rstrip('。，；')  # 去掉末尾中文标点
+        if os.path.exists(p):
+            paths.append(p)
+    return paths
+
+
+def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, workspace: str = "") -> None:
+    """解析回复中的路径，上传文件到飞书，失败时发本地路径兜底。"""
+    paths = _parse_file_paths(reply_text)
+    if not paths:
+        return
+
+    for p in paths:
+        try:
+            upload_path = p
+            file_name = os.path.basename(p)
+
+            # 文件夹 → 压缩
+            if os.path.isdir(p):
+                file_name = os.path.basename(p) + '.zip'
+                upload_path = zip_folder(p)
+                if not os.path.exists(upload_path):
+                    # zip_folder 可能返回带双后缀的路径
+                    upload_path = p + '.zip'
+
+            # 上传
+            result = upload_file_to_feishu(upload_path, access_token, timeout=120)
+            if result.get("success"):
+                send_file_message(chat_id, result["file_key"], file_name, access_token)
+                send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
+            else:
+                send_message(chat_id, f"⚠️ 文件已生成，但上传失败：{result.get('error', '未知错误')}\n本地路径：{upload_path}", access_token)
+        except Exception as e:
+            send_message(chat_id, f"⚠️ 文件处理异常：{e}\n本地路径：{p}", access_token)
+
+
 def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: str, target: str):
     """向指定会话分发消息"""
     if target == "main":
@@ -393,6 +450,12 @@ def _process_main_session(main: MainSession):
                 else:
                     send_message(main.chat_id, reply, get_token())
 
+            # 上传回复中提到的文件
+            try:
+                _send_files_after_reply(main.chat_id, reply, get_token(), main.workspace)
+            except Exception as e:
+                logger.error(f"文件上传失败: {e}")
+
             main.log_message("assistant", reply, session_tag="main")
             logger.info(f"[主会话] 回复: {reply[:80]}...")
 
@@ -485,6 +548,12 @@ def _process_parallel_session(parallel: ParallelSession):
                     reply_message(message_id, reply)
                 else:
                     send_message(parallel.parent_chat_id, reply, get_token())
+
+            # 上传回复中提到的文件
+            try:
+                _send_files_after_reply(parallel.parent_chat_id, reply, get_token(), parent_workspace)
+            except Exception as e:
+                logger.error(f"文件上传失败: {e}")
 
             # 记录回复到主会话日志
             with _global_lock:
