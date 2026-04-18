@@ -40,7 +40,16 @@ DEFAULT_DOWNLOAD_DIR = str(Path(__file__).parent.parent / "data" / "downloads")
 MAX_PARALLEL_SESSIONS = 2  # 最多 2 个并行会话
 MAX_WAITING_QUEUE = 3       # 等待队列最多 3 条
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+# 强制 UTF-8 输出，避免 Windows GBK 乱码
+sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
+sys.stderr.reconfigure(encoding='utf-8') if hasattr(sys.stderr, 'reconfigure') else None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    force=True,
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 
 # ---------- 连接状态跟踪 ----------
@@ -260,8 +269,11 @@ def _process_main_session(main: MainSession):
             # 使用持久客户端
             pc = main.get_persistent_client()
 
+            done = [False]  # 防止心跳覆盖结果卡片
             elapsed = [0]
             def on_heartbeat():
+                if done[0]:
+                    return
                 elapsed[0] += 30
                 if status_msg_id:
                     update_card_message(
@@ -272,6 +284,7 @@ def _process_main_session(main: MainSession):
                     )
 
             reply, new_session_id = pc.chat_sync(message, on_heartbeat=on_heartbeat)
+            done[0] = True
             if new_session_id != main.session_id:
                 main.session_id = new_session_id
                 save_session(main.chat_id, new_session_id)

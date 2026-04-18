@@ -286,16 +286,17 @@ class PersistentClient:
 
         self._reset_idle_timer()
 
-        heartbeat_timer = None
+        self._heartbeat_timer: Optional[threading.Timer] = None
         if on_heartbeat:
             def _tick():
+                next_timer = threading.Timer(30, _tick)
+                next_timer.daemon = True
+                next_timer.start()
+                self._heartbeat_timer = next_timer
                 on_heartbeat()
-                self._heartbeat_timer = threading.Timer(30, _tick)
-                self._heartbeat_timer.daemon = True
-                self._heartbeat_timer.start()
-            heartbeat_timer = threading.Timer(30, _tick)
-            heartbeat_timer.daemon = True
-            heartbeat_timer.start()
+            self._heartbeat_timer = threading.Timer(30, _tick)
+            self._heartbeat_timer.daemon = True
+            self._heartbeat_timer.start()
 
         try:
             result = self._do_chat_sync(message)
@@ -317,8 +318,9 @@ class PersistentClient:
                 return result
             raise
         finally:
-            if heartbeat_timer:
-                heartbeat_timer.cancel()
+            if self._heartbeat_timer:
+                self._heartbeat_timer.cancel()
+                self._heartbeat_timer = None
 
     def _do_chat_sync(self, message: str) -> tuple[str, str]:
         """实际执行聊天（无重试）"""
