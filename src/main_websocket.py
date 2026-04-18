@@ -17,6 +17,7 @@ load_dotenv()
 
 import json
 import logging
+import re
 import signal
 import threading
 import time
@@ -302,32 +303,66 @@ signal.signal(signal.SIGINT, _handle_signal)
 # ---------- 文件上传回传 ----------
 
 def _parse_file_paths(text: str) -> list[str]:
-    """从 Claude 回复中提取文件/文件夹路径。
-
-    匹配格式：
-    - Windows: D:\\xxx\\file.html, C:\\path\\to\\folder\\
-    - Unix: /home/user/file.txt
-    - 相对路径（仅当明确以 ./ 或 ../ 开头）
-    - 排除常见非路径文本（URL、JSON 键名等）
-    """
+    """从 Claude 回复文本中提取文件/文件夹路径。"""
     paths = []
-    # 匹配 Windows 路径（最常见场景）和 Unix 绝对路径
-    path_pattern = re.compile(
-        r'(?:^|(?<=\s)|(?<=\n)|(?<=[:：]))'  # 空白、换行、冒号后
-        r'([A-Za-z]:\\[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)'
+    # 分隔符 lookbehind：空白、换行、冒号、反引号、引号
+    sep = r'[:：`"' + "'" + r']'
+    pattern = re.compile(
+        r'(?:^|(?<=\s)|(?<=\n)|(?<=' + sep + r'))'
+        r'([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)'
     )
-    for match in path_pattern.finditer(text):
-        p = match.group(1).rstrip('。，；')  # 去掉末尾中文标点
+    for match in pattern.finditer(text):
+        p = match.group(1).rstrip('。，；')
         if os.path.exists(p):
             paths.append(p)
     return paths
 
 
-def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, workspace: str = "") -> None:
-    """解析回复中的路径，上传文件到飞书，失败时发本地路径兜底。"""
-    paths = _parse_file_paths(reply_text)
+def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
+    """从 tool_calls 中提取写入/创建的文件路径。
+
+    检测 Write（path）、Edit（file_path）、Bash（命令中的输出文件）。
+    """
+    paths = []
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        inp = tc.get("input", {})
+        if name == "Write" and inp.get("path"):
+            paths.append(inp["path"])
+        elif name == "Edit" and inp.get("file_path"):
+            paths.append(inp["file_path"])
+        elif name == "Bash" and inp.get("command"):
+            # 从 Bash 命令中提取文件路径（cp/mv/python -c/echo> 等）
+            cmd = inp["command"]
+            # 匹配 Windows 路径（正/反斜杠）和 Unix 路径
+            m = re.search(r'(?:cp|mv|python\s+\S+\.py\s*\S*\s+|python\s+-c\s+\S*\s+|echo\s+.*?>\s*|tee\s+>?\s*)\s*([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)', cmd)
+            if m:
+                paths.append(m.group(1))
+    return [p for p in paths if os.path.exists(p)]
+
+
+def _collect_file_paths(reply_text: str, tool_calls: list[dict]) -> list[str]:
+    """合并 tool_calls 路径和文本解析路径，去重排序。"""
+    tool_paths = _extract_tool_file_paths(tool_calls)
+    text_paths = _parse_file_paths(reply_text)
+    logger.info(f"[文件回传] tool_paths={tool_paths}, text_paths={text_paths}")
+    # 合并去重（保持顺序）
+    seen = set()
+    unique = []
+    for p in tool_paths + text_paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, tool_calls: list[dict], workspace: str = "") -> None:
+    """合并 tool_calls 和文本解析得到文件路径，上传到飞书。"""
+    paths = _collect_file_paths(reply_text, tool_calls)
     if not paths:
         return
+
+    logger.info(f"[文件回传] 检测到 {len(paths)} 个文件: {paths}")
 
     for p in paths:
         try:
@@ -339,7 +374,6 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, wo
                 file_name = os.path.basename(p) + '.zip'
                 upload_path = zip_folder(p)
                 if not os.path.exists(upload_path):
-                    # zip_folder 可能返回带双后缀的路径
                     upload_path = p + '.zip'
 
             # 上传
@@ -435,7 +469,7 @@ def _process_main_session(main: MainSession):
                         workspace=main.workspace,
                     )
 
-            reply, new_session_id = pc.chat_sync(message, on_heartbeat=on_heartbeat)
+            reply, new_session_id, tool_calls = pc.chat_sync(message, on_heartbeat=on_heartbeat)
             done[0] = True
             if new_session_id != main.session_id:
                 main.session_id = new_session_id
@@ -452,7 +486,7 @@ def _process_main_session(main: MainSession):
 
             # 上传回复中提到的文件
             try:
-                _send_files_after_reply(main.chat_id, reply, get_token(), main.workspace)
+                _send_files_after_reply(main.chat_id, reply, get_token(), tool_calls, main.workspace)
             except Exception as e:
                 logger.error(f"文件上传失败: {e}")
 
@@ -537,7 +571,7 @@ def _process_parallel_session(parallel: ParallelSession):
             status_res = send_card_message(parallel.parent_chat_id, "🤔 思考中...", get_token(), workspace=parent_workspace)
             status_msg_id = status_res.get("data", {}).get("message_id", "")
 
-            reply, new_session_id = chat_sync(message, session_id=parallel.session_id, cwd=parent_workspace)
+            reply, new_session_id, tool_calls = chat_sync(message, session_id=parallel.session_id, cwd=parent_workspace)
             if new_session_id != parallel.session_id:
                 parallel.session_id = new_session_id
 
@@ -551,7 +585,7 @@ def _process_parallel_session(parallel: ParallelSession):
 
             # 上传回复中提到的文件
             try:
-                _send_files_after_reply(parallel.parent_chat_id, reply, get_token(), parent_workspace)
+                _send_files_after_reply(parallel.parent_chat_id, reply, get_token(), tool_calls, parent_workspace)
             except Exception as e:
                 logger.error(f"文件上传失败: {e}")
 

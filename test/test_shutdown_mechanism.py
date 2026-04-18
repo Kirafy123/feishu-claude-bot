@@ -102,12 +102,12 @@ class TestShutdownCleanup:
         self._patchers = mock_feishu_calls()
         self.p_get_token = patch('src.main_websocket.get_token', return_value='fake-token')
         self.p_get_token.start()
-        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "new-sid"))
+        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "new-sid", []))
         self.p_persistent = patch('src.main_websocket.PersistentClient')
         self.mock_chat_sync = self.p_chat_sync.start()
         mock_pc_class = self.p_persistent.start()
         mock_pc = MagicMock()
-        mock_pc.chat_sync.return_value = ("reply", "new-sid")
+        mock_pc.chat_sync.return_value = ("reply", "new-sid", [])
         mock_pc_class.return_value = mock_pc
 
     def teardown_method(self):

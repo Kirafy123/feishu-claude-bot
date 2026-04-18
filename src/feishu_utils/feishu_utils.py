@@ -205,8 +205,8 @@ def zip_folder(folder_path: str, output_path: str = None) -> str:
     import shutil
     if output_path is None:
         output_path = folder_path + '.zip'
-    shutil.make_archive(folder_path, 'zip', folder_path)
-    return output_path + '.zip' if not output_path.endswith('.zip') else output_path
+    archive_path = shutil.make_archive(folder_path, 'zip', folder_path)
+    return archive_path
 
 
 def update_message(message_id, text, access_token=None):

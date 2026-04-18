@@ -119,13 +119,13 @@ class TestMessageDispatchRouting:
         self.p_get_token = patch('src.main_websocket.get_token', return_value='fake-token')
         self.p_get_token.start()
         # mock chat_sync 和 PersistentClient
-        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "new-sid"))
+        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "new-sid", []))
         self.p_persistent = patch('src.main_websocket.PersistentClient')
         self.mock_chat_sync = self.p_chat_sync.start()
         self.mock_pc_class = self.p_persistent.start()
         # 配置 PersistentClient mock
         mock_pc = MagicMock()
-        mock_pc.chat_sync.return_value = ("reply", "new-sid")
+        mock_pc.chat_sync.return_value = ("reply", "new-sid", [])
         self.mock_pc_class.return_value = mock_pc
         self.mock_pc_instance = mock_pc
 
@@ -363,7 +363,7 @@ class TestPersistentClientLifecycle:
             mock_cls.return_value = mock_sdk
 
             pc = self.PC(cwd="/tmp/test")
-            reply, sid = pc.chat_sync("你好")
+            reply, sid, tool_calls = pc.chat_sync("你好")
 
             mock_sdk.connect.assert_called_once()
             mock_sdk.query.assert_called_once_with("你好")
@@ -456,12 +456,12 @@ class TestLockSafety:
         self._patchers = mock_feishu_calls()
         self.p_get_token = patch('src.main_websocket.get_token', return_value='fake-token')
         self.p_get_token.start()
-        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "sid"))
+        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "sid", []))
         self.p_persistent = patch('src.main_websocket.PersistentClient')
         self.mock_chat_sync = self.p_chat_sync.start()
         mock_pc_class = self.p_persistent.start()
         mock_pc = MagicMock()
-        mock_pc.chat_sync.return_value = ("reply", "sid")
+        mock_pc.chat_sync.return_value = ("reply", "sid", [])
         mock_pc_class.return_value = mock_pc
 
     def teardown_method(self):
@@ -569,12 +569,12 @@ class TestParallelSessionLifecycle:
         self._patchers = mock_feishu_calls()
         self.p_get_token = patch('src.main_websocket.get_token', return_value='fake-token')
         self.p_get_token.start()
-        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "sid"))
+        self.p_chat_sync = patch('src.main_websocket.chat_sync', return_value=("reply", "sid", []))
         self.p_persistent = patch('src.main_websocket.PersistentClient')
         self.mock_chat_sync = self.p_chat_sync.start()
         mock_pc_class = self.p_persistent.start()
         mock_pc = MagicMock()
-        mock_pc.chat_sync.return_value = ("reply", "sid")
+        mock_pc.chat_sync.return_value = ("reply", "sid", [])
         mock_pc_class.return_value = mock_pc
 
     def teardown_method(self):
@@ -742,7 +742,7 @@ class TestSessionRetryMechanism:
 
         with patch('src.claude_code.conversation.ClaudeSDKClient', side_effect=mock_client_factory), \
              patch('src.claude_code.conversation.ClaudeAgentOptions'):
-            reply, sid = chat_sync("你好", session_id="expired-session")
+            reply, sid, tool_calls = chat_sync("你好", session_id="expired-session")
 
             assert call_count >= 2, "应该至少重试一次"
             assert sid == "new-sid"
@@ -764,7 +764,7 @@ class TestSessionRetryMechanism:
             mock_cls.side_effect = create_mock_sdk
 
             pc = PersistentClient(cwd="/tmp/test")
-            reply, sid = pc.chat_sync("你好")
+            reply, sid, tool_calls = pc.chat_sync("你好")
 
             assert pc._connected is True
             pc.disconnect()
@@ -862,7 +862,7 @@ class TestFullMessageFlow:
         self.mock_chat_sync = self.p_chat_sync.start()
         mock_pc_class = self.p_persistent.start()
         mock_pc = MagicMock()
-        mock_pc.chat_sync.return_value = ("reply", "new-sid")
+        mock_pc.chat_sync.return_value = ("reply", "new-sid", [])
         mock_pc_class.return_value = mock_pc
 
     def teardown_method(self):

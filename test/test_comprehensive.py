@@ -42,9 +42,9 @@ class TestPersistentClient(unittest.TestCase):
     def test_init_default_values(self):
         """测试默认参数"""
         pc = PersistentClient()
-        self.assertEqual(pc.idle_timeout, 120)
+        self.assertEqual(pc.idle_timeout, 1920)
         self.assertEqual(pc.allowed_tools, ["Read", "Write", "Edit", "Bash", "Glob", "Grep"])
-        self.assertEqual(pc.permission_mode, "acceptEdits")
+        self.assertEqual(pc.permission_mode, "bypassPermissions")
         self.assertIsNone(pc._client)
         self.assertFalse(pc._connected)
 
@@ -321,7 +321,7 @@ class TestMessageFlow(unittest.TestCase):
         pc = PersistentClient(cwd="/tmp/test")
 
         # 首次聊天应该触发 connect
-        reply, sid = pc.chat_sync("你好")
+        reply, sid, tool_calls = pc.chat_sync("你好")
 
         mock_client.connect.assert_called_once()
         mock_client.query.assert_called_once_with("你好")

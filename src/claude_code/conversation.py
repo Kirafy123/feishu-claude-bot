@@ -147,7 +147,7 @@ class ConversationClient:
         await self.disconnect()
 
 
-def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[str, str]:
+def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[str, str, list[dict]]:
     """
     同步调用 Claude Code（在独立线程中运行，避免事件循环冲突）
 
@@ -157,18 +157,18 @@ def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[st
         cwd: 工作目录路径（可选）
 
     Returns:
-        (回复内容, session_id)
+        (回复内容, session_id, tool_calls)
     """
     import concurrent.futures
 
-    def _run_in_thread(sid: str = None) -> tuple[str, str]:
+    def _run_in_thread(sid: str = None) -> tuple[str, str, list[dict]]:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             async def _chat():
                 async with ConversationClient(session_id=sid, cwd=cwd) as client:
                     r = await client.chat(message)
-                    return r.content, r.session_id
+                    return r.content, r.session_id, r.tool_calls
             return loop.run_until_complete(_chat())
         finally:
             loop.close()
@@ -279,7 +279,7 @@ class PersistentClient:
             self._client = client
             self._connected = True
 
-    def chat_sync(self, message: str, on_heartbeat: Optional[callable] = None) -> tuple[str, str]:
+    def chat_sync(self, message: str, on_heartbeat: Optional[callable] = None) -> tuple[str, str, list[dict]]:
         """发送消息并等待回复，session 失效时自动重试"""
         if not self._connected:
             self.connect()
@@ -322,8 +322,8 @@ class PersistentClient:
                 self._heartbeat_timer.cancel()
                 self._heartbeat_timer = None
 
-    def _do_chat_sync(self, message: str) -> tuple[str, str]:
-        """实际执行聊天（无重试）"""
+    def _do_chat_sync(self, message: str) -> tuple[str, str, list[dict]]:
+        """实际执行聊天（无重试），返回 (回复文本, session_id, tool_calls)"""
         with self._lock:
             client = self._client
             loop = self._loop
@@ -331,14 +331,21 @@ class PersistentClient:
         async def _do_chat():
             await client.query(message)
             response_text = []
+            tool_calls = []
             async for msg in client.receive_response():
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             response_text.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            tool_calls.append({
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            })
                 elif isinstance(msg, ResultMessage):
                     self.session_id = msg.session_id
-            return "\n".join(response_text), self.session_id or ""
+            return "\n".join(response_text), self.session_id or "", tool_calls
 
         future = asyncio.run_coroutine_threadsafe(_do_chat(), loop)
         return future.result(timeout=1800)
