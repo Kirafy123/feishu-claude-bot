@@ -100,11 +100,12 @@ claude login
 
 ### 4. 飞书应用配置
 
-1. 进入 [飞书开放平台](https://open.feishu.cn/)
-2. 创建应用，获取 APP_ID 和 APP_SECRET
-3. 事件订阅 → 选择"使用长连接接收事件"
-4. 添加事件：`im.message.receive_v1`
-5. 权限管理 → 添加 `im:message` 相关权限
+详见 [FEISHU_PERMISSIONS.md](FEISHU_PERMISSIONS.md)，包含：
+
+- 创建应用 + 开启机器人能力
+- 一键导入 8 个必需权限（含批量导入文本）
+- 事件订阅配置（长连接 + `im.message.receive_v1`）
+- 获取 App ID / App Secret 并发布
 
 ### 5. 启动
 
