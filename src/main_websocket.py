@@ -17,6 +17,7 @@ load_dotenv()
 
 import json
 import logging
+import signal
 import threading
 import time
 import uuid
@@ -185,28 +186,114 @@ _main_sessions: dict[str, MainSession] = {}
 _parallel_sessions: dict[str, ParallelSession] = {}
 _waiting_queue: dict[str, Queue] = {}
 _global_lock = threading.Lock()
+_shutting_down = False  # 关闭中标志，阻止新消息入队
 
 
 def _cancel_all_tasks(chat_id: str) -> int:
     """
     取消指定 chat_id 的所有正在处理的任务（主会话 + 并行会话）。
-    返回取消的任务数。
+    清空等待队列。返回取消的任务数。
     """
     count = 0
     with _global_lock:
         if chat_id in _main_sessions:
             main = _main_sessions[chat_id]
+            if main.persistent_client:
+                main.persistent_client.disconnect()
+                main.persistent_client = None
             if main.busy:
-                if main.persistent_client:
-                    main.persistent_client.disconnect()
-                    main.persistent_client = None
                 main.busy = False
                 count += 1
+            # 清空等待队列
+            if chat_id in _waiting_queue:
+                while not _waiting_queue[chat_id].empty():
+                    try:
+                        _waiting_queue[chat_id].get_nowait()
+                    except Empty:
+                        break
         for ps in list(_parallel_sessions.values()):
             if ps.parent_chat_id == chat_id and ps.busy:
                 ps.busy = False
                 count += 1
     return count
+
+
+def shutdown() -> dict:
+    """
+    优雅关闭：取消所有任务、清空队列、断开所有持久客户端。
+    返回清理统计信息。
+    """
+    with _global_lock:
+        cancelled_main = 0
+        cancelled_parallel = 0
+        cleared_waiting = 0
+
+        # 1. 断开所有主会话的持久客户端，清空队列
+        for main in list(_main_sessions.values()):
+            if main.persistent_client:
+                main.persistent_client.disconnect()
+                main.persistent_client = None
+            if main.busy:
+                main.busy = False
+                cancelled_main += 1
+            while not main.queue.empty():
+                try:
+                    main.queue.get_nowait()
+                except Empty:
+                    break
+
+        # 2. 取消所有并行会话
+        for ps in list(_parallel_sessions.values()):
+            if ps.busy:
+                ps.busy = False
+                cancelled_parallel += 1
+            while not ps.queue.empty():
+                try:
+                    ps.queue.get_nowait()
+                except Empty:
+                    break
+        _parallel_sessions.clear()
+
+        # 3. 清空等待队列
+        for q in _waiting_queue.values():
+            cleared_waiting += q.qsize()
+        _waiting_queue.clear()
+
+    logger.info(
+        f"[shutdown] 清理完成: 主会话任务={cancelled_main}, "
+        f"并行会话任务={cancelled_parallel}, 等待队列={cleared_waiting}"
+    )
+    return {
+        "cancelled_main": cancelled_main,
+        "cancelled_parallel": cancelled_parallel,
+        "cleared_waiting": cleared_waiting,
+    }
+
+
+def _sync_session_busy(session) -> None:
+    """同步 busy 标志与线程实际状态，防止线程退出但 busy 仍为 True"""
+    if session.busy and session.thread and not session.thread.is_alive():
+        session.busy = False
+
+
+def _handle_signal(signum, frame):
+    """信号处理器：收到 SIGTERM/SIGINT 时优雅关闭"""
+    logger.info("[signal] 收到终止信号，开始清理...")
+    global _shutting_down
+    _shutting_down = True
+    stats = shutdown()
+    logger.info(f"[signal] 清理结果: {stats}")
+    # 通知所有群
+    notify_all_chats("🔧 Claude Code 服务正在重启，请稍后重试")
+    # 退出主循环
+    import sys
+    sys.exit(0)
+
+
+# 注册信号处理（仅主线程有效）
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 
 def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: str, target: str):
@@ -426,7 +513,10 @@ def _check_close_parallel_nolock(chat_id: str):
                 main.thread = threading.Thread(target=_process_main_session, args=(main,), daemon=True)
                 main.thread.start()
                 return  # 不关闭并行会话
-    # 没有等待消息，检查关闭
+    # 没有等待消息，先同步 busy 状态，再检查关闭
+    for ps in list(_parallel_sessions.values()):
+        if ps.parent_chat_id == chat_id:
+            _sync_session_busy(ps)
     for ps in list(_parallel_sessions.values()):
         if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
             _close_parallel_nolock(ps.session_id)
@@ -456,6 +546,7 @@ def _close_parallel_nolock(session_id: str):
 
 def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     """处理飞书消息 - 多会话分发"""
+    global _shutting_down
     try:
         event = data.event
         message = event.message
@@ -478,6 +569,9 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
         # ========== 文件/图片消息处理 ==========
         if message_type in ("file", "image"):
+            if _shutting_down:
+                send_message(chat_id, "⚠️ 服务正在关闭，请稍后再试", get_token())
+                return
             with _chat_ids_lock:
                 _known_chat_ids.add(chat_id)
 
@@ -559,6 +653,10 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             else:
                 logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
                 with _global_lock:
+                    # 同步并行会话 busy 状态
+                    for ps in list(_parallel_sessions.values()):
+                        if ps.parent_chat_id == chat_id:
+                            _sync_session_busy(ps)
                     idle_parallel = None
                     for ps in _parallel_sessions.values():
                         if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
@@ -597,6 +695,32 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 send_message(chat_id, "ℹ️ 当前没有正在处理的任务", get_token())
             return
 
+        if text in ("/restart", "/重启"):
+            stats = shutdown()
+            msg = (
+                f"✅ 服务已重置\n"
+                f"取消主会话任务: {stats['cancelled_main']}\n"
+                f"取消并行任务: {stats['cancelled_parallel']}\n"
+                f"清空等待队列: {stats['cleared_waiting']}"
+            )
+            send_message(chat_id, msg, get_token())
+            logger.info(f"[{chat_id[:8]}...] 服务重置: {stats}")
+            return
+
+        if text in ("/shutdown", "/关闭服务"):
+            _shutting_down = True
+            stats = shutdown()
+            msg = (
+                f"🔴 服务已关闭\n"
+                f"取消主会话任务: {stats['cancelled_main']}\n"
+                f"取消并行任务: {stats['cancelled_parallel']}\n"
+                f"清空等待队列: {stats['cleared_waiting']}"
+            )
+            send_message(chat_id, msg, get_token())
+            logger.info(f"[{chat_id[:8]}...] 服务关闭: {stats}")
+            import sys
+            sys.exit(0)
+
         if text.startswith("/setworkspace "):
             workspace_path = text.split(" ", 1)[1].strip()
             if not workspace_path:
@@ -628,6 +752,10 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
 
         # ========== 正常消息分发 ==========
+        if _shutting_down:
+            send_message(chat_id, "⚠️ 服务正在关闭，请稍后再试", get_token())
+            return
+
         with _chat_ids_lock:
             _known_chat_ids.add(chat_id)
 
@@ -644,6 +772,9 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     _waiting_queue[chat_id] = Queue()
 
         main = _main_sessions[chat_id]
+
+        # 同步 busy 状态（防止线程崩溃导致 busy 卡住）
+        _sync_session_busy(main)
 
         # ========== 分发逻辑 ==========
         queue_size = _waiting_queue[chat_id].qsize()
@@ -670,6 +801,10 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             # 主会话忙，检查并行会话
             logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
             with _global_lock:
+                # 同步并行会话 busy 状态
+                for ps in list(_parallel_sessions.values()):
+                    if ps.parent_chat_id == chat_id:
+                        _sync_session_busy(ps)
                 idle_parallel = None
                 for ps in _parallel_sessions.values():
                     if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
