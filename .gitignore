@@ -9,6 +9,7 @@ dist/
 build/
 venv/
 .venv/
+rc-venv/
 
 # 环境变量
 .env

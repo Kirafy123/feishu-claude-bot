@@ -1,3 +1,3 @@
-from .conversation import ConversationClient, ChatResponse, chat_sync
+from .conversation import ConversationClient, ChatResponse, chat_sync, PersistentClient
 
-__all__ = ["ConversationClient", "ChatResponse", "chat_sync"]
+__all__ = ["ConversationClient", "ChatResponse", "chat_sync", "PersistentClient"]

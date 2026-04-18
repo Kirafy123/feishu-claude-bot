@@ -28,6 +28,18 @@
 - 打开/关闭应用程序
 - Git 操作、包管理等开发任务
 
+**文件分析**
+
+- 在飞书中直接发送文件给机器人（PDF、Word、Excel、图片等）
+- 自动下载到工作空间，Claude Code 读取并分析内容
+- 文件消息附带文字时，合并分析
+
+**长任务处理**
+
+- 30 分钟超时保护，避免任务无限挂起
+- 每 30 秒自动更新进度卡片，用户实时可见
+- `/cancel` 或 `/取消任务` 随时中断正在处理的任务
+
 ## 与 ClawdBot 的比较
 
 | 特性 | 本项目 | ClawdBot |
@@ -38,6 +50,8 @@
 | 连接方式 | 飞书长连接 WebSocket | Webhook |
 | 多用户支持 | **每个聊天独立上下文** | 全局/按用户 |
 | 会话管理 | SQLite 持久化 | 内存/Redis |
+| 文件处理 | **支持文件下载分析** | 不支持 |
+| 任务控制 | **随时取消长任务** | 不支持 |
 
 **相似之处：**
 - 都是将 Claude 接入企业聊天工具
@@ -49,6 +63,7 @@
 - **每个聊天窗口独立上下文**，群聊成员共享同一上下文
 - 飞书长连接方式，无需公网域名
 - 轻量级，单文件即可运行
+- 文件下载自动分析，长任务实时进度反馈
 
 ## 快速开始
 
@@ -97,14 +112,20 @@ claude login
 # 前台运行
 python -m src.main_websocket
 
-# 后台运行
+# 后台运行（Windows）
+start.bat
+
+# 停止（Windows）
+stop.bat
+
+# 后台运行（Linux/macOS）
 ./start.sh
 
-# 停止
+# 停止（Linux/macOS）
 ./stop.sh
 
 # 查看日志
-tail -f log.log
+tail -f logs/service.log
 ```
 
 ## 使用示例
@@ -118,22 +139,45 @@ tail -f log.log
 @机器人 当前目录有哪些文件
 ```
 
+发送文件：
+```
+（直接发送一个 PDF/Word/Excel/图片文件给机器人）
+→ 自动下载并分析文件内容
+```
+
+设置工作空间：
+```
+@机器人 /setworkspace D:\my_project
+@机器人 /workspace
+```
+
+取消任务：
+```
+@机器人 /cancel
+@机器人 /取消任务
+```
+
 ## 项目结构
 
 ```
 ├── src/
 │   ├── main_websocket.py      # 主程序（飞书长连接）
+│   ├── main.py                # 旧版 Webhook 方式（保留）
 │   ├── claude_code/           # Claude Code 封装
-│   │   ├── conversation.py    # 对话客户端
+│   │   ├── conversation.py    # 对话客户端（持久连接 + 心跳）
 │   │   └── __init__.py
 │   ├── feishu_utils/          # 飞书工具
-│   │   └── feishu_utils.py
+│   │   └── feishu_utils.py    # 消息发送 + 文件下载
 │   └── data_base_utils/       # 数据库
-│       └── session_store.py   # 会话存储
+│       └── session_store.py   # 会话存储（含工作空间）
 ├── data/
-│   └── sessions.db            # SQLite 数据库
+│   ├── sessions.db            # SQLite 数据库
+│   └── downloads/             # 文件下载目录（无 workspace 时使用）
+├── logs/                      # 运行日志
+├── test/                      # 测试用例
 ├── .env                       # 环境变量
-├── start.sh / stop.sh         # 启停脚本
+├── start.bat / stop.bat       # Windows 启停脚本
+├── start.sh / stop.sh         # Linux/macOS 启停脚本
 └── requirements.txt
 ```
 
@@ -143,6 +187,14 @@ tail -f log.log
 - claude-agent-sdk（Claude Code Python SDK）
 - lark-oapi（飞书 SDK）
 - SQLite（会话持久化）
+
+## 命令参考
+
+| 命令 | 说明 |
+|------|------|
+| `/setworkspace <路径>` | 设置当前聊天的工作空间 |
+| `/workspace` | 查看当前工作空间 |
+| `/cancel` / `/取消任务` | 取消所有正在处理的任务 |
 
 ## 扩展其他 Agent
 
@@ -174,7 +226,7 @@ def chat_sync(message: str, session_id: str = None) -> tuple[str, str]:
     Args:
         message: 用户消息
         session_id: 会话 ID（用于保持上下文）
-    
+
     Returns:
         (回复内容, 新的 session_id)
     """
