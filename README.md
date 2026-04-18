@@ -85,20 +85,7 @@ APP_ID=cli_xxxxxx
 APP_SECRET=xxxxxx
 ```
 
-### 3. 安装 Claude Code
-
-```bash
-# macOS/Linux
-curl -fsSL https://claude.ai/install.sh | bash
-
-# Windows
-npm install -g @anthropic-ai/claude-code
-
-# 登录
-claude login
-```
-
-### 4. 飞书应用配置
+### 3. 飞书应用配置
 
 详见 [FEISHU_PERMISSIONS.md](FEISHU_PERMISSIONS.md)，包含：
 
@@ -107,7 +94,7 @@ claude login
 - 事件订阅配置（长连接 + `im.message.receive_v1`）
 - 获取 App ID / App Secret 并发布
 
-### 5. 启动
+### 4. 启动
 
 ```bash
 # 前台运行
