@@ -39,3 +39,8 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 本地个人授权/测试产物
+CLAUDE.md
+hello.html
+sample_data.xlsx

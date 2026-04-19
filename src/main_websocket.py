@@ -192,6 +192,17 @@ _waiting_queue: dict[str, Queue] = {}
 _global_lock = threading.Lock()
 _shutting_down = False  # 关闭中标志，阻止新消息入队
 
+# 文件消息合并窗口：文件消息到达后，等待 N 秒让用户补充文本，避免文件和说明被分到不同会话
+PENDING_MERGE_SECONDS = 45
+_pending_attachments: dict[str, dict] = {}  # chat_id -> {paths, names, timer, message_id, chat_type, status_msg_id, workspace}
+_pending_lock = threading.Lock()
+
+# 回传文件命名：记录每个 chat_id 最近上传的文件原始 stem 列表（FIFO，单任务最多挂 10 个）
+# 并给每个 stem 维护递增版本号，回传时重命名为 {stem}_v{NN}.{ext}
+_expected_reply_basenames: dict[str, list[str]] = {}  # chat_id -> [stem1, stem2, ...]
+_reply_version_counter: dict[tuple, int] = {}  # (chat_id, stem) -> next version
+_reply_name_lock = threading.Lock()
+
 
 def _cancel_all_tasks(chat_id: str) -> int:
     """
@@ -281,15 +292,26 @@ def _sync_session_busy(session) -> None:
 
 
 def _handle_signal(signum, frame):
-    """信号处理器：收到 SIGTERM/SIGINT 时优雅关闭"""
+    """信号处理器：收到 SIGTERM/SIGINT 时优雅关闭。
+    注意：信号处理器内不做阻塞网络调用，避免卡死。通知丢到后台线程。
+    """
     logger.info("[signal] 收到终止信号，开始清理...")
     global _shutting_down
     _shutting_down = True
-    stats = shutdown()
-    logger.info(f"[signal] 清理结果: {stats}")
-    # 通知所有群
-    notify_all_chats("🔧 Claude Code 服务正在重启，请稍后重试")
-    # 退出主循环
+    try:
+        stats = shutdown()
+        logger.info(f"[signal] 清理结果: {stats}")
+    except Exception as e:
+        logger.error(f"[signal] shutdown 异常: {e}")
+    # 后台发通知，最多等 3 秒
+    def _bg_notify():
+        try:
+            notify_all_chats("🔧 Claude Code 服务正在重启，请稍后重试")
+        except Exception as e:
+            logger.error(f"[signal] 通知失败: {e}")
+    t = threading.Thread(target=_bg_notify, daemon=True)
+    t.start()
+    t.join(timeout=3)
     import sys
     sys.exit(0)
 
@@ -318,6 +340,45 @@ def _parse_file_paths(text: str) -> list[str]:
     return paths
 
 
+# 允许上传的路径白名单前缀（规范化后比较）
+def _is_path_allowed(path: str, workspace: str = "") -> bool:
+    """只允许 workspace、DEFAULT_DOWNLOAD_DIR、系统临时目录、当前 cwd 下的文件。
+    防止把 /etc/... 或其他用户目录的文件误回传。
+    """
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return False
+    allowed_roots = []
+    if workspace:
+        try:
+            allowed_roots.append(os.path.realpath(workspace))
+        except Exception:
+            pass
+    try:
+        allowed_roots.append(os.path.realpath(DEFAULT_DOWNLOAD_DIR))
+    except Exception:
+        pass
+    try:
+        allowed_roots.append(os.path.realpath(os.getcwd()))
+    except Exception:
+        pass
+    import tempfile as _tmp
+    try:
+        allowed_roots.append(os.path.realpath(_tmp.gettempdir()))
+    except Exception:
+        pass
+    for root in allowed_roots:
+        if not root:
+            continue
+        try:
+            if real == root or real.startswith(root + os.sep):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
     """从 tool_calls 中提取写入/创建的文件路径。
 
@@ -327,8 +388,10 @@ def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
     for tc in tool_calls:
         name = tc.get("name", "")
         inp = tc.get("input", {})
-        if name == "Write" and inp.get("path"):
-            paths.append(inp["path"])
+        if name == "Write":
+            p = inp.get("file_path") or inp.get("path")
+            if p:
+                paths.append(p)
         elif name == "Edit" and inp.get("file_path"):
             paths.append(inp["file_path"])
         elif name == "Bash" and inp.get("command"):
@@ -341,8 +404,8 @@ def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
     return [p for p in paths if os.path.exists(p)]
 
 
-def _collect_file_paths(reply_text: str, tool_calls: list[dict]) -> list[str]:
-    """合并 tool_calls 路径和文本解析路径，去重排序。"""
+def _collect_file_paths(reply_text: str, tool_calls: list[dict], workspace: str = "") -> list[str]:
+    """合并 tool_calls 路径和文本解析路径，去重排序，并应用白名单过滤。"""
     tool_paths = _extract_tool_file_paths(tool_calls)
     text_paths = _parse_file_paths(reply_text)
     logger.info(f"[文件回传] tool_paths={tool_paths}, text_paths={text_paths}")
@@ -350,15 +413,58 @@ def _collect_file_paths(reply_text: str, tool_calls: list[dict]) -> list[str]:
     seen = set()
     unique = []
     for p in tool_paths + text_paths:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        if not _is_path_allowed(p, workspace):
+            logger.warning(f"[文件回传] 路径不在白名单内，跳过: {p}")
+            continue
+        unique.append(p)
     return unique
+
+
+def _derive_reply_filename(chat_id: str, original_basename: str) -> str:
+    """根据 chat_id 记录的原始上传文件 stem，为回传文件生成 {stem}_v{NN}.{ext} 命名。
+    匹配规则：
+      1) 回传文件名的 stem 就在列表里 → 用该 stem
+      2) 回传文件名包含任一原 stem 作为子串 → 用该 stem
+      3) 列表只有一个 stem → 直接用它（最常见的"处理这个文件"场景）
+      4) 都不匹配 → 保留原名（去掉我们加的 chat_id_timestamp_ 前缀，如果有）
+    版本号按 (chat_id, stem) 递增，从 01 开始。
+    """
+    base = os.path.basename(original_basename)
+    stem, ext = os.path.splitext(base)
+
+    with _reply_name_lock:
+        candidates = list(_expected_reply_basenames.get(chat_id, []))
+        matched_stem = None
+        if candidates:
+            if stem in candidates:
+                matched_stem = stem
+            else:
+                for c in candidates:
+                    if c and c in stem:
+                        matched_stem = c
+                        break
+                if matched_stem is None and len(candidates) == 1:
+                    matched_stem = candidates[0]
+
+        if matched_stem:
+            key = (chat_id, matched_stem)
+            ver = _reply_version_counter.get(key, 0) + 1
+            _reply_version_counter[key] = ver
+            return f"{matched_stem}_v{ver:02d}{ext}"
+
+    # 去掉 "chat_id_timestamp_" 前缀（如果是我们下载存下的）
+    m = re.match(r'^oc_[0-9a-f]+_\d+_(.+)$', base)
+    if m:
+        return m.group(1)
+    return base
 
 
 def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, tool_calls: list[dict], workspace: str = "") -> None:
     """合并 tool_calls 和文本解析得到文件路径，上传到飞书。"""
-    paths = _collect_file_paths(reply_text, tool_calls)
+    paths = _collect_file_paths(reply_text, tool_calls, workspace=workspace)
     if not paths:
         return
 
@@ -367,17 +473,21 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, to
     for p in paths:
         try:
             upload_path = p
-            file_name = os.path.basename(p)
+            raw_name = os.path.basename(p)
 
             # 文件夹 → 压缩
             if os.path.isdir(p):
-                file_name = os.path.basename(p) + '.zip'
+                raw_name = os.path.basename(p) + '.zip'
                 upload_path = zip_folder(p)
                 if not os.path.exists(upload_path):
                     upload_path = p + '.zip'
 
+            # 按原始文件名 + 版本号重命名
+            file_name = _derive_reply_filename(chat_id, raw_name)
+            logger.info(f"[文件回传] 重命名 {raw_name} -> {file_name}")
+
             # 上传
-            result = upload_file_to_feishu(upload_path, access_token, timeout=120)
+            result = upload_file_to_feishu(upload_path, access_token, timeout=120, file_name=file_name)
             if result.get("success"):
                 send_file_message(chat_id, result["file_key"], file_name, access_token)
                 send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
@@ -405,16 +515,146 @@ def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: st
             logger.info(f"[{chat_id[:8]}...] 主会话线程已创建")
     elif target == "parallel":
         with _global_lock:
-            parallel = list(_parallel_sessions.values())[0]
-            # 检测崩溃
-            if parallel.busy and parallel.thread and not parallel.thread.is_alive():
-                parallel.busy = False
-                parallel.thread = None
+            # 只选属于当前 chat_id 且空闲的并行会话；优先复用
+            parallel = None
+            for ps in _parallel_sessions.values():
+                if ps.parent_chat_id != chat_id:
+                    continue
+                # 检测崩溃
+                if ps.busy and ps.thread and not ps.thread.is_alive():
+                    ps.busy = False
+                    ps.thread = None
+                if not ps.busy and ps.queue.empty():
+                    parallel = ps
+                    break
+            # 找不到空闲的就退而求其次：任何属于本 chat 的
+            if parallel is None:
+                for ps in _parallel_sessions.values():
+                    if ps.parent_chat_id == chat_id:
+                        parallel = ps
+                        break
+        if parallel is None:
+            logger.error(f"[{chat_id[:8]}...] dispatch parallel 失败：找不到所属并行会话，回退主会话")
+            _dispatch_to_session(chat_id, text, message_id, chat_type, "main")
+            return
         parallel.queue.put((text, message_id, chat_type))
         if parallel.thread is None or not parallel.thread.is_alive():
             parallel.busy = True
             parallel.thread = threading.Thread(target=_process_parallel_session, args=(parallel,), daemon=True)
             parallel.thread.start()
+
+
+def _route_message(chat_id: str, text: str, message_id: str, chat_type: str) -> None:
+    """统一分发：主会话空闲→主；否则→并行/新并行/等待队列。
+    供纯文本、文件消息、合并消息共用。
+    调用前需保证 _main_sessions[chat_id] 和 _waiting_queue[chat_id] 已初始化。
+    """
+    main = _main_sessions[chat_id]
+    queue_size = _waiting_queue[chat_id].qsize()
+
+    if queue_size > 0:
+        if queue_size >= MAX_WAITING_QUEUE:
+            send_message(chat_id, f"⚠️ 等待队列已满（{queue_size}/{MAX_WAITING_QUEUE}），请稍后再试", get_token())
+        else:
+            _waiting_queue[chat_id].put((text, message_id, chat_type))
+            send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})，空闲时自动处理", get_token())
+        return
+
+    if not main.busy and main.queue.empty():
+        logger.info(f"[{chat_id[:8]}...] 分发→主会话")
+        _dispatch_to_session(chat_id, text, message_id, chat_type, "main")
+        return
+
+    logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
+    with _global_lock:
+        for ps in list(_parallel_sessions.values()):
+            if ps.parent_chat_id == chat_id and ps.busy and ps.thread and not ps.thread.is_alive():
+                ps.busy = False
+                ps.thread = None
+        idle_parallel = None
+        for ps in _parallel_sessions.values():
+            if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
+                idle_parallel = ps
+                break
+
+    if idle_parallel:
+        logger.info(f"[{chat_id[:8]}...] 分发→并行会话 {idle_parallel.session_id[:8]}")
+        _dispatch_to_session(chat_id, text, message_id, chat_type, "parallel")
+    elif len(_parallel_sessions) < MAX_PARALLEL_SESSIONS:
+        new_sid = str(uuid.uuid4())
+        parallel = ParallelSession(session_id=new_sid, parent_chat_id=chat_id)
+        with _global_lock:
+            _parallel_sessions[new_sid] = parallel
+        logger.info(f"[{chat_id[:8]}...] 创建新并行会话 {new_sid[:8]}")
+        _dispatch_to_session(chat_id, text, message_id, chat_type, "parallel")
+    else:
+        if queue_size >= MAX_WAITING_QUEUE:
+            send_message(chat_id, f"⚠️ 等待队列已满，请稍后再试", get_token())
+        else:
+            _waiting_queue[chat_id].put((text, message_id, chat_type))
+            send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})", get_token())
+
+
+def _flush_pending_attachment(chat_id: str, extra_text: str = "") -> None:
+    """把挂起的文件消息（可选合并新文本）真正分发出去。
+    extra_text 非空表示用户在窗口内补充了说明。
+    """
+    with _pending_lock:
+        pending = _pending_attachments.pop(chat_id, None)
+    if not pending:
+        return
+    # 取消定时器
+    timer = pending.get("timer")
+    if timer:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+
+    paths = pending["paths"]
+    names = pending["names"]
+    message_id = pending["message_id"]
+    chat_type = pending["chat_type"]
+    status_msg_id = pending.get("status_msg_id")
+    workspace = pending.get("workspace")
+
+    # 构造合并后的 prompt
+    file_desc = "\n".join(f"- {n} -> {p}" for n, p in zip(names, paths))
+    if extra_text.strip():
+        synthetic_text = f"{extra_text}\n\n附带文件:\n{file_desc}"
+    else:
+        synthetic_text = f"用户发送了 {len(paths)} 个文件，请读取并分析内容:\n{file_desc}"
+
+    # 定格状态卡片：不再用"思考中"（会跟会话线程的实时卡冲突），改成接收确认的终态文案
+    if status_msg_id:
+        try:
+            preview = "、".join(names[:3])
+            if len(names) > 3:
+                preview += f" 等 {len(names)} 个文件"
+            update_card_message(status_msg_id, f"📎 已接收文件：{preview}，开始处理...", get_token(), workspace=workspace)
+        except Exception:
+            pass
+
+    # 记录原始文件 stem，供回传时命名参考
+    with _reply_name_lock:
+        stems = []
+        for n in names:
+            stem, _ext = os.path.splitext(n)
+            if stem:
+                stems.append(stem)
+        _expected_reply_basenames[chat_id] = stems
+
+    main = _main_sessions.get(chat_id)
+    if main:
+        main.log_message("user", synthetic_text[:200], session_tag="file-merged" if extra_text.strip() else "file-timeout")
+
+    _route_message(chat_id, synthetic_text, message_id, chat_type)
+
+
+def _schedule_pending_timeout(chat_id: str) -> None:
+    """窗口到期未等到文本，按"仅文件"模式分发"""
+    logger.info(f"[{chat_id[:8]}...] 文件合并窗口超时 ({PENDING_MERGE_SECONDS}s)，按无说明分发")
+    _flush_pending_attachment(chat_id, extra_text="")
 
 
 def _process_main_session(main: MainSession):
@@ -725,7 +965,7 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             status_msg_id = status_res.get("data", {}).get("message_id", "")
 
             try:
-                download_file_message(message_id, file_key, save_path, get_token())
+                download_file_message(message_id, file_key, save_path, get_token(), res_type=("image" if message_type == "image" else "file"))
                 logger.info(f"[{chat_id[:8]}...] 文件下载成功: {save_path}")
             except Exception as e:
                 logger.error(f"[{chat_id[:8]}...] 文件下载失败: {e}")
@@ -737,60 +977,58 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
             # 合并文本和文件路径
             if text.strip():
+                # 文件消息自带说明文字 → 直接正常分发，无需等待
                 synthetic_text = f"{text}\n\n文件路径: {save_path}"
-            else:
-                synthetic_text = f"用户发送了一个文件: {safe_name}，已保存到 {save_path}，请读取并分析内容"
-
-            # 记录日志
-            main.log_message("user", f"[{message_type}] {safe_name} -> {save_path}", session_tag="file")
-
-            # 更新状态卡片，进入分发流程
-            if status_msg_id:
-                update_card_message(status_msg_id, "🤔 思考中...", get_token(), workspace=workspace)
-
-            # ========== 走正常分发逻辑 ==========
-            queue_size = _waiting_queue[chat_id].qsize()
-            if queue_size > 0:
-                if queue_size >= MAX_WAITING_QUEUE:
-                    send_message(chat_id, f"⚠️ 等待队列已满，请稍后再试", get_token())
-                else:
-                    _waiting_queue[chat_id].put((synthetic_text, message_id, chat_type))
-                    send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})", get_token())
+                main.log_message("user", f"[{message_type}] {safe_name} -> {save_path}", session_tag="file")
+                # 记录原始 stem 供回传命名
+                with _reply_name_lock:
+                    stem, _ext = os.path.splitext(safe_name)
+                    _expected_reply_basenames[chat_id] = [stem] if stem else []
+                if status_msg_id:
+                    update_card_message(status_msg_id, f"📎 已接收文件：{safe_name}，开始处理...", get_token(), workspace=workspace)
+                _route_message(chat_id, synthetic_text, message_id, chat_type)
                 return
 
-            if not main.busy and main.queue.empty():
-                logger.info(f"[{chat_id[:8]}...] 分发→主会话")
-                _dispatch_to_session(chat_id, synthetic_text, message_id, chat_type, "main")
-            else:
-                logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
-                with _global_lock:
-                    # 检测并行会话崩溃：busy=True 但线程已死 → 重置
-                    for ps in list(_parallel_sessions.values()):
-                        if ps.parent_chat_id == chat_id and ps.busy and ps.thread and not ps.thread.is_alive():
-                            ps.busy = False
-                            ps.thread = None
-                    idle_parallel = None
-                    for ps in _parallel_sessions.values():
-                        if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
-                            idle_parallel = ps
-                            break
-
-                if idle_parallel:
-                    logger.info(f"[{chat_id[:8]}...] 分发→并行会话 {idle_parallel.session_id[:8]}")
-                    _dispatch_to_session(chat_id, synthetic_text, message_id, chat_type, "parallel")
-                elif len(_parallel_sessions) < MAX_PARALLEL_SESSIONS:
-                    new_sid = str(uuid.uuid4())
-                    parallel = ParallelSession(session_id=new_sid, parent_chat_id=chat_id)
-                    with _global_lock:
-                        _parallel_sessions[new_sid] = parallel
-                    logger.info(f"[{chat_id[:8]}...] 创建新并行会话 {new_sid[:8]}")
-                    _dispatch_to_session(chat_id, synthetic_text, message_id, chat_type, "parallel")
+            # 文件消息无说明 → 进入 45s 合并窗口，等用户补充文字
+            main.log_message("user", f"[{message_type}] {safe_name} -> {save_path}", session_tag="file-pending")
+            with _pending_lock:
+                existing = _pending_attachments.get(chat_id)
+                if existing:
+                    # 同一 chat 连发多个文件 → 累加，重置计时器
+                    try:
+                        existing["timer"].cancel()
+                    except Exception:
+                        pass
+                    existing["paths"].append(save_path)
+                    existing["names"].append(safe_name)
+                    existing["message_id"] = message_id
+                    existing["chat_type"] = chat_type
+                    existing["status_msg_id"] = status_msg_id or existing.get("status_msg_id")
+                    new_timer = threading.Timer(PENDING_MERGE_SECONDS, _schedule_pending_timeout, args=(chat_id,))
+                    new_timer.daemon = True
+                    existing["timer"] = new_timer
+                    new_timer.start()
                 else:
-                    if queue_size >= MAX_WAITING_QUEUE:
-                        send_message(chat_id, f"⚠️ 等待队列已满，请稍后再试", get_token())
-                    else:
-                        _waiting_queue[chat_id].put((synthetic_text, message_id, chat_type))
-                        send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})", get_token())
+                    timer = threading.Timer(PENDING_MERGE_SECONDS, _schedule_pending_timeout, args=(chat_id,))
+                    timer.daemon = True
+                    _pending_attachments[chat_id] = {
+                        "paths": [save_path],
+                        "names": [safe_name],
+                        "message_id": message_id,
+                        "chat_type": chat_type,
+                        "status_msg_id": status_msg_id,
+                        "workspace": workspace,
+                        "timer": timer,
+                    }
+                    timer.start()
+
+            if status_msg_id:
+                update_card_message(
+                    status_msg_id,
+                    f"📎 已收到文件 `{safe_name}`，等待你的说明（{PENDING_MERGE_SECONDS}s 内未补充将直接分析）",
+                    get_token(),
+                    workspace=workspace,
+                )
             return
 
         # ========== 纯文本消息 ==========
@@ -885,63 +1123,17 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
         main = _main_sessions[chat_id]
 
-        # ========== 分发逻辑 ==========
-        queue_size = _waiting_queue[chat_id].qsize()
-        logger.info(f"[{chat_id[:8]}...] 分发检查: busy={main.busy}, queue_empty={main.queue.empty()}, waiting_size={queue_size}")
-
-        # 1. 等待队列有消息 → 新消息入等待队列
-        if queue_size > 0:
-            if queue_size >= MAX_WAITING_QUEUE:
-                send_message(chat_id, f"⚠️ 等待队列已满（{queue_size}/{MAX_WAITING_QUEUE}），请稍后再试", get_token())
-                main.log_message("system", f"队列满，消息被拒绝", session_tag="queue")
-            else:
-                _waiting_queue[chat_id].put((text, message_id, chat_type))
-                send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})，空闲时自动处理", get_token())
-                main.log_message("user", text, session_tag=f"queue({queue_size+1})")
+        # 如果该 chat 有挂起的文件消息 → 用当前文本作为说明，立即合并分发
+        with _pending_lock:
+            has_pending = chat_id in _pending_attachments
+        if has_pending:
+            logger.info(f"[{chat_id[:8]}...] 命中文件合并窗口，合并当前文本分发")
+            _flush_pending_attachment(chat_id, extra_text=text)
             return
 
-        # 2. 等待队列空，检查各会话状态
-        if not main.busy and main.queue.empty():
-            # 主会话空闲 → 主会话处理
-            logger.info(f"[{chat_id[:8]}...] 分发→主会话")
-            _dispatch_to_session(chat_id, text, message_id, chat_type, "main")
-
-        else:
-            # 主会话忙，检查并行会话
-            logger.info(f"[{chat_id[:8]}...] 主会话忙，检查并行")
-            with _global_lock:
-                # 检测并行会话崩溃：busy=True 但线程已死 → 重置
-                for ps in list(_parallel_sessions.values()):
-                    if ps.parent_chat_id == chat_id and ps.busy and ps.thread and not ps.thread.is_alive():
-                        ps.busy = False
-                        ps.thread = None
-                idle_parallel = None
-                for ps in _parallel_sessions.values():
-                    if ps.parent_chat_id == chat_id and not ps.busy and ps.queue.empty():
-                        idle_parallel = ps
-                        break
-
-            if idle_parallel:
-                # 并行会话空闲 → 并行会话处理
-                logger.info(f"[{chat_id[:8]}...] 分发→并行会话 {idle_parallel.session_id[:8]}")
-                _dispatch_to_session(chat_id, text, message_id, chat_type, "parallel")
-            elif len(_parallel_sessions) < MAX_PARALLEL_SESSIONS:
-                # 没有并行会话 → 创建并行会话处理
-                new_sid = str(uuid.uuid4())
-                parallel = ParallelSession(session_id=new_sid, parent_chat_id=chat_id)
-                with _global_lock:
-                    _parallel_sessions[new_sid] = parallel
-                logger.info(f"[{chat_id[:8]}...] 创建新并行会话 {new_sid[:8]}")
-                _dispatch_to_session(chat_id, text, message_id, chat_type, "parallel")
-            else:
-                # 所有会话都忙 → 入等待队列
-                if queue_size >= MAX_WAITING_QUEUE:
-                    send_message(chat_id, f"⚠️ 等待队列已满，请稍后再试", get_token())
-                    main.log_message("system", "队列满，消息被拒绝", session_tag="queue")
-                else:
-                    _waiting_queue[chat_id].put((text, message_id, chat_type))
-                    send_message(chat_id, f"⏳ 已加入队列({queue_size+1}/{MAX_WAITING_QUEUE})，空闲时自动处理", get_token())
-                    main.log_message("user", text, session_tag=f"queue({queue_size+1})")
+        # ========== 分发逻辑 ==========
+        logger.info(f"[{chat_id[:8]}...] 分发检查: busy={main.busy}, queue_empty={main.queue.empty()}, waiting_size={_waiting_queue[chat_id].qsize()}")
+        _route_message(chat_id, text, message_id, chat_type)
 
     except Exception as e:
         logger.error(f"处理消息失败: {e}")

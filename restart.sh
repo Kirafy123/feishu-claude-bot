@@ -6,15 +6,28 @@ echo "[1/2] 正在停止服务..."
 pkill -f "main_websocket" 2>/dev/null
 sleep 2
 
-# 重新启动
-echo "[2/2] 正在启动服务..."
-if [ -f "rc-venv/bin/python" ]; then
-    nohup rc-venv/bin/python -m src.main_websocket >> logs/service.log 2>&1 &
+# 选择 Python 解释器（同 start.sh）
+if [ -n "$PYTHON_BIN" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    PY="$PYTHON_BIN"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+elif [ -x "venv/bin/python" ]; then
+    PY="venv/bin/python"
+elif command -v python3.11 >/dev/null 2>&1; then
+    PY="python3.11"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
 else
-    nohup python3 -m src.main_websocket >> logs/service.log 2>&1 &
+    echo "❌ 找不到 Python 解释器" >&2
+    exit 1
 fi
+
+echo "[2/2] 正在启动服务 ($PY)..."
+mkdir -p logs
+nohup "$PY" -m src.main_websocket >> logs/service.log 2>&1 &
+echo $! > .pid
 
 sleep 2
 echo ""
-echo "✅ 服务已重启，日志: logs/service.log"
+echo "✅ 服务已重启 (PID: $(cat .pid))，日志: logs/service.log"
 echo ""

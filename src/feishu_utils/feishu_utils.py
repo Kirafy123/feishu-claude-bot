@@ -117,16 +117,19 @@ def update_card_message(message_id, text, access_token=None, workspace=None):
     return res
 
 
-def download_file_message(message_id: str, file_key: str, save_path: str, access_token=None, timeout: int = 300) -> bool:
+def download_file_message(message_id: str, file_key: str, save_path: str, access_token=None, timeout: int = 300, res_type: str = "file") -> bool:
     """
     下载消息中的资源文件（文件、图片等）
-    GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}
+    GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file|image
+    res_type: "file" 或 "image"
     返回 True 表示下载成功
     """
     if access_token is None:
         access_token = get_tenant_access_token()
 
-    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}'
+    if res_type not in ("file", "image"):
+        res_type = "file"
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}'
     headers = get_headers(access_token)
 
     res = requests.get(url, headers=headers, timeout=timeout)
@@ -139,10 +142,11 @@ def download_file_message(message_id: str, file_key: str, save_path: str, access
         raise Exception(f'下载文件失败: {res.status_code}, {res.text}')
 
 
-def upload_file_to_feishu(file_path: str, access_token=None, timeout: int = 120) -> dict:
+def upload_file_to_feishu(file_path: str, access_token=None, timeout: int = 120, file_name: str = None) -> dict:
     """
     上传本地文件到飞书 IM，返回 file_key。
     限制：≤30MB，超时 120 秒。
+    file_name: 可选，指定飞书侧显示的文件名（不影响本地文件）。默认使用本地 basename。
     返回格式: {"success": True, "file_key": "xxx"} 或 {"success": False, "error": "xxx"}
     """
     if access_token is None:
@@ -157,14 +161,14 @@ def upload_file_to_feishu(file_path: str, access_token=None, timeout: int = 120)
     url = 'https://open.feishu.cn/open-apis/im/v1/files'
     headers = get_headers(access_token)
 
-    file_name = os.path.basename(file_path)
+    display_name = file_name if file_name else os.path.basename(file_path)
     with open(file_path, 'rb') as f:
         files = {
-            'file': (file_name, f),
+            'file': (display_name, f),
         }
         data = {
             'file_type': 'stream',
-            'file_name': file_name,
+            'file_name': display_name,
         }
         try:
             res = requests.post(url, headers={'Authorization': headers['Authorization']}, data=data, files=files, timeout=timeout)
