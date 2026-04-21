@@ -1041,6 +1041,7 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             # 限制集合大小，避免内存泄漏
             if len(_processed_messages) > 1000:
                 _processed_messages.clear()
+                _processed_messages.add(message_id)
         chat_type = message.chat_type
         message_type = message.message_type
 
