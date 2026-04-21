@@ -192,8 +192,12 @@ _waiting_queue: dict[str, Queue] = {}
 _global_lock = threading.Lock()
 _shutting_down = False  # 关闭中标志，阻止新消息入队
 
+# 消息去重：防止飞书重发导致同一消息被处理多次
+_processed_messages: set[str] = set()
+_processed_messages_lock = threading.Lock()
+
 # 文件消息合并窗口：文件消息到达后，等待 N 秒让用户补充文本，避免文件和说明被分到不同会话
-PENDING_MERGE_SECONDS = 45
+PENDING_MERGE_SECONDS = 60
 _pending_attachments: dict[str, dict] = {}  # chat_id -> {paths, names, timer, message_id, chat_type, status_msg_id, workspace}
 _pending_lock = threading.Lock()
 
@@ -324,19 +328,44 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 # ---------- 文件上传回传 ----------
 
-def _parse_file_paths(text: str) -> list[str]:
-    """从 Claude 回复文本中提取文件/文件夹路径。"""
+def _parse_file_paths(text: str, workspace: str = "") -> list[str]:
+    r"""从 Claude 回复文本中提取文件/文件夹路径。
+
+    支持格式：
+    - 直接路径：C:\path\file.txt 或 /path/file.txt
+    - 被引号/反引号包裹的路径
+    - 相对路径（在 workspace 下补全）
+    """
     paths = []
-    # 分隔符 lookbehind：空白、换行、冒号、反引号、引号
-    sep = r'[:：`"' + "'" + r']'
+
+    # 1) Windows 绝对路径 + Unix 绝对路径
     pattern = re.compile(
-        r'(?:^|(?<=\s)|(?<=\n)|(?<=' + sep + r'))'
-        r'([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)'
+        r'[`"\'(]*([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+)[`"\')]*'
+        r'|[`"\'(]*(/[^\s"\'`<>|,*]+)[`"\')]*',
     )
     for match in pattern.finditer(text):
-        p = match.group(1).rstrip('。，；')
+        p = match.group(1) or match.group(2)
+        p = p.rstrip('。，；')
         if os.path.exists(p):
             paths.append(p)
+
+    # 2) 相对路径（如 output/file.xlsx），需要在 workspace 下补全
+    if workspace:
+        rel_pattern = re.compile(
+            r'[`"\'(\s]([a-zA-Z0-9_一-鿀][^\s"\'`<>|,*]*\.[a-zA-Z]{2,6})[`"\')\s]*'
+        )
+        for match in rel_pattern.finditer(text):
+            rel = match.group(1).rstrip('。，；')
+            # 跳过已经是绝对路径的
+            if os.path.isabs(rel):
+                continue
+            # 跳过 URL（包含 :// 的匹配）
+            if '://' in rel:
+                continue
+            full = os.path.join(workspace, rel)
+            if os.path.exists(full):
+                paths.append(full)
+
     return paths
 
 
@@ -368,6 +397,17 @@ def _is_path_allowed(path: str, workspace: str = "") -> bool:
         allowed_roots.append(os.path.realpath(_tmp.gettempdir()))
     except Exception:
         pass
+    # 允许上传的额外目录
+    extra_allowed = [
+        r"D:\finance",
+        r"D:\finance\2026年4月_经营报表分析",
+        r"D:\finance\2026年4月_经营报表分析\output",
+    ]
+    for extra in extra_allowed:
+        try:
+            allowed_roots.append(os.path.realpath(extra))
+        except Exception:
+            pass
     for root in allowed_roots:
         if not root:
             continue
@@ -382,7 +422,7 @@ def _is_path_allowed(path: str, workspace: str = "") -> bool:
 def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
     """从 tool_calls 中提取写入/创建的文件路径。
 
-    检测 Write（path）、Edit（file_path）、Bash（命令中的输出文件）。
+    检测 Write（path/file_path）、Edit（file_path）、Bash（命令中的输出文件）。
     """
     paths = []
     for tc in tool_calls:
@@ -395,19 +435,34 @@ def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
         elif name == "Edit" and inp.get("file_path"):
             paths.append(inp["file_path"])
         elif name == "Bash" and inp.get("command"):
-            # 从 Bash 命令中提取文件路径（cp/mv/python -c/echo> 等）
             cmd = inp["command"]
-            # 匹配 Windows 路径（正/反斜杠）和 Unix 路径
-            m = re.search(r'(?:cp|mv|python\s+\S+\.py\s*\S*\s+|python\s+-c\s+\S*\s+|echo\s+.*?>\s*|tee\s+>?\s*)\s*([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)', cmd)
-            if m:
-                paths.append(m.group(1))
+            # 从 Bash 命令中提取文件路径
+            # 支持：cp, mv, cat >, curl -o, wget -O, tee, echo >, python script.py, >>
+            # 捕获组统一支持绝对路径和相对路径（相对路径由 os.path.exists 过滤）
+            path_capture = r'([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+|[a-zA-Z0-9_一-鿀][^\s"\'`<>|,]*\.[a-zA-Z]{2,6})'
+            bash_patterns = [
+                # cp/mv source destination
+                r'(?:cp|mv)\s+(?:\S+\s+)*?' + path_capture + r'(?:\s*[;&|]|$)',
+                # curl -o / wget -O file
+                r'(?:curl\s+(?:-\S+\s+)*-o\s+|wget\s+(?:-\S+\s+)*-O\s+)' + path_capture,
+                # cat > / cat >> / echo > / echo >> / tee > / tee >>
+                # 用 (?:\S+\s+)*? 非贪婪匹配，在第一个 > 前停止，避免捕获输入文件
+                r'(?:cat|echo|tee)\s+(?:\S+\s+)*?>{1,2}\s*' + path_capture,
+                # python script.py output_file (脚本名后跟一个路径)
+                r'python(?:3)?\s+\S+\.py\s+(?:[^&;|]+\s+)*?' + path_capture,
+            ]
+            for pat in bash_patterns:
+                m = re.search(pat, cmd)
+                if m:
+                    paths.append(m.group(1))
+                    break
     return [p for p in paths if os.path.exists(p)]
 
 
 def _collect_file_paths(reply_text: str, tool_calls: list[dict], workspace: str = "") -> list[str]:
     """合并 tool_calls 路径和文本解析路径，去重排序，并应用白名单过滤。"""
     tool_paths = _extract_tool_file_paths(tool_calls)
-    text_paths = _parse_file_paths(reply_text)
+    text_paths = _parse_file_paths(reply_text, workspace=workspace)
     logger.info(f"[文件回传] tool_paths={tool_paths}, text_paths={text_paths}")
     # 合并去重（保持顺序）
     seen = set()
@@ -649,6 +704,7 @@ def _flush_pending_attachment(chat_id: str, extra_text: str = "") -> None:
         main.log_message("user", synthetic_text[:200], session_tag="file-merged" if extra_text.strip() else "file-timeout")
 
     _route_message(chat_id, synthetic_text, message_id, chat_type)
+    return
 
 
 def _schedule_pending_timeout(chat_id: str) -> None:
@@ -903,6 +959,16 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         message = event.message
         message_id = message.message_id
         chat_id = message.chat_id
+
+        # 消息去重：已处理过的 message_id 直接忽略
+        with _processed_messages_lock:
+            if message_id in _processed_messages:
+                logger.info(f"[{chat_id[:8]}...] 消息 {message_id[:8]}... 已处理过，忽略重复")
+                return
+            _processed_messages.add(message_id)
+            # 限制集合大小，避免内存泄漏
+            if len(_processed_messages) > 1000:
+                _processed_messages.clear()
         chat_type = message.chat_type
         message_type = message.message_type
 
