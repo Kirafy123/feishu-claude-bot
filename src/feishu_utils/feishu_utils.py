@@ -3,6 +3,10 @@ import re
 import requests
 import json
 import os
+import logging
+import time as _time
+
+logger = logging.getLogger(__name__)
 
 app_id = os.getenv('APP_ID')
 app_secret = os.getenv('APP_SECRET')
@@ -63,7 +67,7 @@ def send_card_message(receive_id, text, access_token=None, workspace=None):
     url = 'https://open.feishu.cn/open-apis/im/v1/messages'
     param = {'receive_id_type': 'chat_id'}
 
-    title = "🤖 CCwin"
+    title = "CCwin"
     if workspace:
         import os
         title += f" | {os.path.basename(workspace)}"
@@ -95,7 +99,7 @@ def update_card_message(message_id, text, access_token=None, workspace=None):
 
     url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}'
 
-    title = "🤖 CCwin"
+    title = "CCwin"
     if workspace:
         import os
         title += f" | {os.path.basename(workspace)}"
@@ -145,42 +149,73 @@ def download_file_message(message_id: str, file_key: str, save_path: str, access
 def upload_file_to_feishu(file_path: str, access_token=None, timeout: int = 120, file_name: str = None) -> dict:
     """
     上传本地文件到飞书 IM，返回 file_key。
-    限制：≤30MB，超时 120 秒。
-    file_name: 可选，指定飞书侧显示的文件名（不影响本地文件）。默认使用本地 basename。
+    限制：≤30MB，超时 120 秒。失败自动重试 2 次，间隔 3 秒。
+    file_name: 可选，指定飞书侧显示的文件名。
     返回格式: {"success": True, "file_key": "xxx"} 或 {"success": False, "error": "xxx"}
     """
     if access_token is None:
         access_token = get_tenant_access_token()
 
-    # 检查文件大小
+    # 检查文件存在性和大小
+    if not os.path.isfile(file_path):
+        return {"success": False, "error": f"文件不存在: {file_path}"}
     file_size = os.path.getsize(file_path)
     max_size = 30 * 1024 * 1024  # 30MB
     if file_size > max_size:
         return {"success": False, "error": f"文件过大（{file_size / 1024 / 1024:.1f}MB > 30MB）"}
 
     url = 'https://open.feishu.cn/open-apis/im/v1/files'
-    headers = get_headers(access_token)
-
     display_name = file_name if file_name else os.path.basename(file_path)
-    with open(file_path, 'rb') as f:
-        files = {
-            'file': (display_name, f),
-        }
-        data = {
-            'file_type': 'stream',
-            'file_name': display_name,
-        }
+
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            logger.info(f"[上传] 重试 {attempt}/{max_retries}: {display_name} (等待 3 秒)")
+            _time.sleep(3)
+
+        headers = get_headers(access_token)
+        start_t = _time.time()
+
         try:
-            res = requests.post(url, headers={'Authorization': headers['Authorization']}, data=data, files=files, timeout=timeout)
-            res_json = res.json()
-            if res_json.get('code') == 0:
-                return {"success": True, "file_key": res_json['data']['file_key']}
-            else:
-                return {"success": False, "error": res_json.get('msg', '上传失败')}
+            with open(file_path, 'rb') as f:
+                files = {'file': (display_name, f)}
+                data = {
+                    'file_type': 'stream',
+                    'file_name': display_name,
+                }
+                res = requests.post(
+                    url,
+                    headers={'Authorization': headers['Authorization']},
+                    data=data,
+                    files=files,
+                    timeout=timeout,
+                )
+                res_json = res.json()
+                elapsed = _time.time() - start_t
+
+                if res_json.get('code') == 0:
+                    file_key = res_json['data']['file_key']
+                    logger.info(f"[上传] 成功: {display_name} ({file_size} bytes, {elapsed:.1f}s)")
+                    return {"success": True, "file_key": file_key}
+                else:
+                    error_msg = res_json.get('msg', '上传失败')
+                    logger.warning(f"[上传] 失败 (attempt {attempt+1}/{max_retries+1}): {display_name} - {error_msg} ({elapsed:.1f}s)")
+                    # API 逻辑错误不重试
+                    return {"success": False, "error": error_msg}
         except requests.exceptions.Timeout:
-            return {"success": False, "error": "上传超时（120 秒）"}
+            elapsed = _time.time() - start_t
+            logger.warning(f"[上传] 超时 (attempt {attempt+1}/{max_retries+1}): {display_name} ({elapsed:.1f}s)")
+            if attempt == max_retries:
+                return {"success": False, "error": "上传超时（120 秒）"}
+            # 继续重试
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            elapsed = _time.time() - start_t
+            logger.warning(f"[上传] 异常 (attempt {attempt+1}/{max_retries+1}): {display_name} - {e} ({elapsed:.1f}s)")
+            if attempt == max_retries:
+                return {"success": False, "error": str(e)}
+            # 继续重试
+
+    return {"success": False, "error": "上传失败（重试耗尽）"}
 
 
 def send_file_message(receive_id: str, file_key: str, file_name: str, access_token=None, chat_type: str = "chat") -> dict:
@@ -199,8 +234,14 @@ def send_file_message(receive_id: str, file_key: str, file_name: str, access_tok
     }
     try:
         res = requests.post(url, headers=get_headers(access_token), json=body, params=param, timeout=30)
-        return res.json()
+        res_json = res.json()
+        if res_json.get('code') == 0:
+            logger.info(f"[发送文件消息] 成功: {file_name}")
+        else:
+            logger.warning(f"[发送文件消息] 失败: {file_name} - {res_json.get('msg', '未知错误')}")
+        return res_json
     except Exception as e:
+        logger.warning(f"[发送文件消息] 异常: {file_name} - {e}")
         return {"code": -1, "msg": str(e)}
 
 

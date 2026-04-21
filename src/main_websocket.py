@@ -192,8 +192,12 @@ _waiting_queue: dict[str, Queue] = {}
 _global_lock = threading.Lock()
 _shutting_down = False  # 关闭中标志，阻止新消息入队
 
+# 消息去重：防止飞书重发导致同一消息被处理多次
+_processed_messages: set[str] = set()
+_processed_messages_lock = threading.Lock()
+
 # 文件消息合并窗口：文件消息到达后，等待 N 秒让用户补充文本，避免文件和说明被分到不同会话
-PENDING_MERGE_SECONDS = 45
+PENDING_MERGE_SECONDS = 60
 _pending_attachments: dict[str, dict] = {}  # chat_id -> {paths, names, timer, message_id, chat_type, status_msg_id, workspace}
 _pending_lock = threading.Lock()
 
@@ -360,19 +364,44 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 # ---------- 文件上传回传 ----------
 
-def _parse_file_paths(text: str) -> list[str]:
-    """从 Claude 回复文本中提取文件/文件夹路径。"""
+def _parse_file_paths(text: str, workspace: str = "") -> list[str]:
+    r"""从 Claude 回复文本中提取文件/文件夹路径。
+
+    支持格式：
+    - 直接路径：C:\path\file.txt 或 /path/file.txt
+    - 被引号/反引号包裹的路径
+    - 相对路径（在 workspace 下补全）
+    """
     paths = []
-    # 分隔符 lookbehind：空白、换行、冒号、反引号、引号
-    sep = r'[:：`"' + "'" + r']'
+
+    # 1) Windows 绝对路径 + Unix 绝对路径
     pattern = re.compile(
-        r'(?:^|(?<=\s)|(?<=\n)|(?<=' + sep + r'))'
-        r'([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)'
+        r'[`"\'(]*([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+)[`"\')]*'
+        r'|[`"\'(]*(/[^\s"\'`<>|,*]+)[`"\')]*',
     )
     for match in pattern.finditer(text):
-        p = match.group(1).rstrip('。，；')
+        p = match.group(1) or match.group(2)
+        p = p.rstrip('。，；')
         if os.path.exists(p):
             paths.append(p)
+
+    # 2) 相对路径（如 output/file.xlsx），需要在 workspace 下补全
+    if workspace:
+        rel_pattern = re.compile(
+            r'[`"\'(\s]([a-zA-Z0-9_一-鿀][^\s"\'`<>|,*]*\.[a-zA-Z]{2,6})[`"\')\s]*'
+        )
+        for match in rel_pattern.finditer(text):
+            rel = match.group(1).rstrip('。，；')
+            # 跳过已经是绝对路径的
+            if os.path.isabs(rel):
+                continue
+            # 跳过 URL（包含 :// 的匹配）
+            if '://' in rel:
+                continue
+            full = os.path.join(workspace, rel)
+            if os.path.exists(full):
+                paths.append(full)
+
     return paths
 
 
@@ -404,6 +433,17 @@ def _is_path_allowed(path: str, workspace: str = "") -> bool:
         allowed_roots.append(os.path.realpath(_tmp.gettempdir()))
     except Exception:
         pass
+    # 允许上传的额外目录
+    extra_allowed = [
+        r"D:\finance",
+        r"D:\finance\2026年4月_经营报表分析",
+        r"D:\finance\2026年4月_经营报表分析\output",
+    ]
+    for extra in extra_allowed:
+        try:
+            allowed_roots.append(os.path.realpath(extra))
+        except Exception:
+            pass
     for root in allowed_roots:
         if not root:
             continue
@@ -418,7 +458,7 @@ def _is_path_allowed(path: str, workspace: str = "") -> bool:
 def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
     """从 tool_calls 中提取写入/创建的文件路径。
 
-    检测 Write（path）、Edit（file_path）、Bash（命令中的输出文件）。
+    检测 Write（path/file_path）、Edit（file_path）、Bash（命令中的输出文件）。
     """
     paths = []
     for tc in tool_calls:
@@ -431,19 +471,34 @@ def _extract_tool_file_paths(tool_calls: list[dict]) -> list[str]:
         elif name == "Edit" and inp.get("file_path"):
             paths.append(inp["file_path"])
         elif name == "Bash" and inp.get("command"):
-            # 从 Bash 命令中提取文件路径（cp/mv/python -c/echo> 等）
             cmd = inp["command"]
-            # 匹配 Windows 路径（正/反斜杠）和 Unix 路径
-            m = re.search(r'(?:cp|mv|python\s+\S+\.py\s*\S*\s+|python\s+-c\s+\S*\s+|echo\s+.*?>\s*|tee\s+>?\s*)\s*([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+)', cmd)
-            if m:
-                paths.append(m.group(1))
+            # 从 Bash 命令中提取文件路径
+            # 支持：cp, mv, cat >, curl -o, wget -O, tee, echo >, python script.py, >>
+            # 捕获组统一支持绝对路径和相对路径（相对路径由 os.path.exists 过滤）
+            path_capture = r'([A-Za-z]:(?:\\|/)[^\s"\'`<>|,*]+|/[^\s"\'`<>|,*]+|[a-zA-Z0-9_一-鿀][^\s"\'`<>|,]*\.[a-zA-Z]{2,6})'
+            bash_patterns = [
+                # cp/mv source destination
+                r'(?:cp|mv)\s+(?:\S+\s+)*?' + path_capture + r'(?:\s*[;&|]|$)',
+                # curl -o / wget -O file
+                r'(?:curl\s+(?:-\S+\s+)*-o\s+|wget\s+(?:-\S+\s+)*-O\s+)' + path_capture,
+                # cat > / cat >> / echo > / echo >> / tee > / tee >>
+                # 用 (?:\S+\s+)*? 非贪婪匹配，在第一个 > 前停止，避免捕获输入文件
+                r'(?:cat|echo|tee)\s+(?:\S+\s+)*?>{1,2}\s*' + path_capture,
+                # python script.py output_file (脚本名后跟一个路径)
+                r'python(?:3)?\s+\S+\.py\s+(?:[^&;|]+\s+)*?' + path_capture,
+            ]
+            for pat in bash_patterns:
+                m = re.search(pat, cmd)
+                if m:
+                    paths.append(m.group(1))
+                    break
     return [p for p in paths if os.path.exists(p)]
 
 
 def _collect_file_paths(reply_text: str, tool_calls: list[dict], workspace: str = "") -> list[str]:
     """合并 tool_calls 路径和文本解析路径，去重排序，并应用白名单过滤。"""
     tool_paths = _extract_tool_file_paths(tool_calls)
-    text_paths = _parse_file_paths(reply_text)
+    text_paths = _parse_file_paths(reply_text, workspace=workspace)
     logger.info(f"[文件回传] tool_paths={tool_paths}, text_paths={text_paths}")
     # 合并去重（保持顺序）
     seen = set()
@@ -534,10 +589,60 @@ def _third_layer_detect(chat_id: str, reply_text: str, workspace: str = "") -> l
     return found_paths
 
 
+def wait_for_file_ready(path: str, max_wait: float = 5.0, poll_interval: float = 0.5) -> tuple[bool, str]:
+    """等待文件完全写入磁盘。
+
+    通过检查文件大小稳定（连续两次读取相同）判断就绪。
+
+    Returns:
+        (True, "ready") — 文件就绪可上传
+        (False, "reason") — 文件未就绪的原因
+    """
+    if not os.path.exists(path):
+        return False, "文件不存在"
+
+    # 空文件视为就绪（没有内容要写）
+    try:
+        if os.path.getsize(path) == 0:
+            return True, "ready (empty)"
+    except OSError:
+        pass
+
+    start = time.time()
+    last_size = -1
+    stable_count = 0
+    current_size = 0
+
+    while time.time() - start < max_wait:
+        try:
+            current_size = os.path.getsize(path)
+        except OSError:
+            # 文件可能被锁定，稍后重试
+            time.sleep(poll_interval)
+            continue
+
+        if current_size == last_size and current_size > 0:
+            stable_count += 1
+            if stable_count >= 2:
+                return True, "ready"
+        else:
+            stable_count = 0
+
+        last_size = current_size
+        time.sleep(poll_interval)
+
+    if last_size > 0:
+        # 文件存在但大小仍在变化，接受当前状态
+        return True, "partial (accepted)"
+
+    return False, f"等待超时 ({max_wait}s)，最终大小: {last_size}"
+
+
 def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, tool_calls: list[dict], workspace: str = "") -> None:
     """合并 tool_calls 和文本解析得到文件路径，上传到飞书。"""
     paths = _collect_file_paths(reply_text, tool_calls, workspace=workspace)
     if not paths:
+        # 第三层：现有检测未找到文件，尝试从回复中提取文件名并搜索
         logger.info(f"[文件回传] 现有检测未找到文件，触发第三层智能检测")
         paths = _third_layer_detect(chat_id, reply_text, workspace)
         if not paths:
@@ -555,6 +660,9 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, to
 
     for p in paths:
         try:
+            file_size = os.path.getsize(p)
+            logger.info(f"[文件回传] 开始处理: {p} ({file_size} bytes)")
+
             upload_path = p
             raw_name = os.path.basename(p)
 
@@ -564,20 +672,39 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, to
                 upload_path = zip_folder(p)
                 if not os.path.exists(upload_path):
                     upload_path = p + '.zip'
+                logger.info(f"[文件回传] 目录已压缩: {p} -> {upload_path}")
+
+            # 等待文件就绪
+            ready, reason = wait_for_file_ready(upload_path)
+            if not ready:
+                logger.warning(f"[文件回传] 文件未就绪: {upload_path} - {reason}")
+                send_message(chat_id, f"⚠️ 文件可能未完全写入，无法回传：{raw_name}\n本地路径：{upload_path}", access_token)
+                continue
+            if reason == "partial (accepted)":
+                logger.warning(f"[文件回传] 文件部分写入但仍发送: {upload_path}")
 
             # 按原始文件名 + 版本号重命名
             file_name = _derive_reply_filename(chat_id, raw_name)
             logger.info(f"[文件回传] 重命名 {raw_name} -> {file_name}")
 
-            # 上传
+            # 上传（内置重试）
             result = upload_file_to_feishu(upload_path, access_token, timeout=120, file_name=file_name)
             if result.get("success"):
-                send_file_message(chat_id, result["file_key"], file_name, access_token)
-                send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
+                file_key = result["file_key"]
+                send_result = send_file_message(chat_id, file_key, file_name, access_token)
+                if send_result.get("code") == 0:
+                    send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
+                    logger.info(f"[文件回传] 完成: {p} -> {file_name}")
+                else:
+                    err = send_result.get("msg", "未知错误")
+                    send_message(chat_id, f"⚠️ 文件已上传但发送消息失败：{err}\nfile_key: {file_key}", access_token)
+                    logger.warning(f"[文件回传] 文件消息发送失败: {file_name} - {err}")
             else:
                 send_message(chat_id, f"⚠️ 文件已生成，但上传失败：{result.get('error', '未知错误')}\n本地路径：{upload_path}", access_token)
+                logger.error(f"[文件回传] 上传失败: {p} - {result.get('error')}")
         except Exception as e:
             send_message(chat_id, f"⚠️ 文件处理异常：{e}\n本地路径：{p}", access_token)
+            logger.error(f"[文件回传] 处理异常: {p} - {e}", exc_info=True)
 
 
 def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: str, target: str):
@@ -843,6 +970,7 @@ def _flush_pending_attachment(chat_id: str, extra_text: str = "") -> None:
         main.log_message("user", synthetic_text[:200], session_tag="file-merged" if extra_text.strip() else "file-timeout")
 
     _route_message(chat_id, synthetic_text, message_id, chat_type)
+    return
 
 
 def _schedule_pending_timeout(chat_id: str) -> None:
@@ -1111,6 +1239,17 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         message = event.message
         message_id = message.message_id
         chat_id = message.chat_id
+
+        # 消息去重：已处理过的 message_id 直接忽略
+        with _processed_messages_lock:
+            if message_id in _processed_messages:
+                logger.info(f"[{chat_id[:8]}...] 消息 {message_id[:8]}... 已处理过，忽略重复")
+                return
+            _processed_messages.add(message_id)
+            # 限制集合大小，避免内存泄漏
+            if len(_processed_messages) > 1000:
+                _processed_messages.clear()
+                _processed_messages.add(message_id)
         chat_type = message.chat_type
         message_type = message.message_type
 
