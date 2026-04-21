@@ -1243,6 +1243,15 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         if not text:
             return
 
+        # ========== 处理文件选择回复 ==========
+        with _file_selection_lock:
+            is_selection = chat_id in _file_selection_state
+        if is_selection:
+            handled = _handle_file_selection_reply(chat_id, text)
+            if handled:
+                return
+            # 如果 _handle_file_selection_reply 返回 False，继续正常转发
+
         # ========== 处理命令 ==========
         if text in ("/cancel", "/取消任务"):
             count = _cancel_all_tasks(chat_id)
