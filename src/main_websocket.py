@@ -498,13 +498,60 @@ def _derive_reply_filename(chat_id: str, original_basename: str) -> str:
     return base
 
 
+def _third_layer_detect(chat_id: str, reply_text: str, workspace: str = "") -> list[str]:
+    """第三层检测：从 Claude 回复中提取提到的文件名，在 workspace 中搜索。
+
+    当 tool_calls 中没有文件操作、回复中没有明确路径时触发。
+    """
+    if not workspace:
+        return []
+
+    mentioned_files = []
+    pattern = re.compile(
+        r'([\w一-鿿]+(?:\.[a-zA-Z]{2,6}))'
+    )
+    for m in pattern.finditer(reply_text):
+        name = m.group(1)
+        ext = os.path.splitext(name)[1].lower()
+        if ext in _SUPPORTED_EXTENSIONS:
+            mentioned_files.append(name)
+
+    if not mentioned_files:
+        return []
+
+    mentioned_files = list(dict.fromkeys(mentioned_files))
+
+    found_paths = []
+    seen = set()
+    for filename in mentioned_files:
+        stem = os.path.splitext(filename)[0]
+        candidates = _search_workspace_for_file(stem, workspace)
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                found_paths.append(p)
+
+    return found_paths
+
+
 def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, tool_calls: list[dict], workspace: str = "") -> None:
     """合并 tool_calls 和文本解析得到文件路径，上传到飞书。"""
     paths = _collect_file_paths(reply_text, tool_calls, workspace=workspace)
     if not paths:
-        return
+        logger.info(f"[文件回传] 现有检测未找到文件，触发第三层智能检测")
+        paths = _third_layer_detect(chat_id, reply_text, workspace)
+        if not paths:
+            logger.info(f"[文件回传] 第三层检测也未找到文件")
+            return
+        logger.info(f"[文件回传] 第三层检测到 {len(paths)} 个文件: {paths}")
 
     logger.info(f"[文件回传] 检测到 {len(paths)} 个文件: {paths}")
+
+    # 第三层检测到多个文件时，发送选择卡片让用户选择
+    if len(paths) > 3:
+        logger.info(f"[文件回传] 检测到多个文件({len(paths)}个)，发送选择卡片")
+        _send_file_selection_card(chat_id, paths, reply_text[:50], access_token, workspace=workspace)
+        return
 
     for p in paths:
         try:
