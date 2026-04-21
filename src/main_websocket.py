@@ -580,6 +580,117 @@ def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: st
             parallel.thread.start()
 
 
+def _is_file_request(text: str) -> bool:
+    """判断用户消息是否为文件索取意图"""
+    return any(re.search(p, text) for p in _FILE_REQUEST_PATTERNS)
+
+
+def _extract_requested_filename(text: str) -> str | None:
+    """从用户消息中提取他们想要的文件名（带扩展名）"""
+    pattern = r'([\w一-鿿]+(?:\.[a-zA-Z]{2,6}))'
+    matches = re.findall(pattern, text)
+    for m in matches:
+        ext = os.path.splitext(m)[1].lower()
+        if ext in _SUPPORTED_EXTENSIONS:
+            return m
+    return None
+
+
+def _search_workspace_for_file(filename: str, workspace: str) -> list[str]:
+    """在 workspace 下搜索匹配文件名的文件，返回按修改时间降序排序的列表"""
+    if not workspace or not os.path.isdir(workspace):
+        return []
+    pattern = os.path.join(workspace, "**", f"*{filename}*")
+    matches = glob.glob(pattern, recursive=True)
+    matches = [m for m in matches if not os.path.basename(m).startswith('.')]
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return matches
+
+
+def _send_file_selection_card(chat_id: str, candidates: list[str], original_text: str,
+                               access_token: str, workspace: str = "") -> None:
+    """发送文件选择卡片消息，让用户从多个匹配中选择"""
+    options_text = "\n".join(
+        f"{i+1}. {os.path.basename(c)}" for i, c in enumerate(candidates[:5])
+    )
+    if len(candidates) > 5:
+        options_text += f"\n... 等 {len(candidates)} 个文件"
+
+    card_text = (
+        f"找到以下匹配文件，请回复序号或输入更具体的文件名：\n\n"
+        f"{options_text}\n\n"
+        f"（60 秒内未选择将转 Claude 处理）"
+    )
+    send_card_message(chat_id, card_text, access_token, workspace=workspace)
+
+    def _on_timeout():
+        with _file_selection_lock:
+            _file_selection_state.pop(chat_id, None)
+        send_message(chat_id, "⏳ 文件选择超时，已转 Claude 处理", access_token)
+
+    timer = threading.Timer(60, _on_timeout)
+    timer.start()
+
+    with _file_selection_lock:
+        _file_selection_state[chat_id] = {
+            "candidates": candidates,
+            "timer": timer,
+            "original_text": original_text,
+            "access_token": access_token,
+            "workspace": workspace,
+        }
+
+
+def _handle_file_selection_reply(chat_id: str, text: str) -> bool:
+    """处理用户在文件选择中的回复。返回 True 表示已处理，False 表示需要继续转发 Claude。"""
+    with _file_selection_lock:
+        state = _file_selection_state.pop(chat_id, None)
+    if not state:
+        return False
+
+    state["timer"].cancel()
+
+    candidates = state["candidates"]
+    access_token = state["access_token"]
+    workspace = state["workspace"]
+
+    if text.strip().isdigit():
+        idx = int(text.strip()) - 1
+        if 0 <= idx < len(candidates):
+            target = candidates[idx]
+            file_name = os.path.basename(target)
+            result = upload_file_to_feishu(target, access_token, timeout=120, file_name=file_name)
+            if result.get("success"):
+                send_file_message(chat_id, result["file_key"], file_name, access_token)
+                send_message(chat_id, f"✅ 已发送：{file_name}", access_token)
+            else:
+                send_message(chat_id, f"⚠️ 上传失败：{result.get('error', '未知错误')}", access_token)
+            return True
+        else:
+            send_message(chat_id, f"⚠️ 序号超出范围，请重新输入（1-{len(candidates)}）", access_token)
+            _send_file_selection_card(chat_id, candidates, state["original_text"], access_token, workspace)
+            return True
+
+    user_keyword = text.strip().lower()
+    filtered = [p for p in candidates if user_keyword in os.path.basename(p).lower()]
+    if len(filtered) == 1:
+        target = filtered[0]
+        file_name = os.path.basename(target)
+        result = upload_file_to_feishu(target, access_token, timeout=120, file_name=file_name)
+        if result.get("success"):
+            send_file_message(chat_id, result["file_key"], file_name, access_token)
+            send_message(chat_id, f"✅ 已发送：{file_name}", access_token)
+        else:
+            send_message(chat_id, f"⚠️ 上传失败：{result.get('error', '未知错误')}", access_token)
+        return True
+    elif len(filtered) > 1:
+        _send_file_selection_card(chat_id, filtered, text, access_token, workspace)
+        return True
+    else:
+        send_message(chat_id, f"⚠️ 未找到更匹配的文件，已转 Claude 处理", access_token)
+        return False
+
+
 def _route_message(chat_id: str, text: str, message_id: str, chat_type: str) -> None:
     """统一分发：主会话空闲→主；否则→并行/新并行/等待队列。
     供纯文本、文件消息、合并消息共用。
