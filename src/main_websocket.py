@@ -517,16 +517,69 @@ def _derive_reply_filename(chat_id: str, original_basename: str) -> str:
     return base
 
 
+def wait_for_file_ready(path: str, max_wait: float = 5.0, poll_interval: float = 0.5) -> tuple[bool, str]:
+    """等待文件完全写入磁盘。
+
+    通过检查文件大小稳定（连续两次读取相同）判断就绪。
+
+    Returns:
+        (True, "ready") — 文件就绪可上传
+        (False, "reason") — 文件未就绪的原因
+    """
+    if not os.path.exists(path):
+        return False, "文件不存在"
+
+    # 空文件视为就绪（没有内容要写）
+    try:
+        if os.path.getsize(path) == 0:
+            return True, "ready (empty)"
+    except OSError:
+        pass
+
+    start = time.time()
+    last_size = -1
+    stable_count = 0
+    current_size = 0
+
+    while time.time() - start < max_wait:
+        try:
+            current_size = os.path.getsize(path)
+        except OSError:
+            # 文件可能被锁定，稍后重试
+            time.sleep(poll_interval)
+            continue
+
+        if current_size == last_size and current_size > 0:
+            stable_count += 1
+            if stable_count >= 2:
+                return True, "ready"
+        else:
+            stable_count = 0
+
+        last_size = current_size
+        time.sleep(poll_interval)
+
+    if last_size > 0:
+        # 文件存在但大小仍在变化，接受当前状态
+        return True, "partial (accepted)"
+
+    return False, f"等待超时 ({max_wait}s)，最终大小: {last_size}"
+
+
 def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, tool_calls: list[dict], workspace: str = "") -> None:
     """合并 tool_calls 和文本解析得到文件路径，上传到飞书。"""
     paths = _collect_file_paths(reply_text, tool_calls, workspace=workspace)
     if not paths:
+        logger.info(f"[文件回传] 未检测到需要回传的文件")
         return
 
     logger.info(f"[文件回传] 检测到 {len(paths)} 个文件: {paths}")
 
     for p in paths:
         try:
+            file_size = os.path.getsize(p)
+            logger.info(f"[文件回传] 开始处理: {p} ({file_size} bytes)")
+
             upload_path = p
             raw_name = os.path.basename(p)
 
@@ -536,20 +589,39 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, to
                 upload_path = zip_folder(p)
                 if not os.path.exists(upload_path):
                     upload_path = p + '.zip'
+                logger.info(f"[文件回传] 目录已压缩: {p} -> {upload_path}")
+
+            # 等待文件就绪
+            ready, reason = wait_for_file_ready(upload_path)
+            if not ready:
+                logger.warning(f"[文件回传] 文件未就绪: {upload_path} - {reason}")
+                send_message(chat_id, f"⚠️ 文件可能未完全写入，无法回传：{raw_name}\n本地路径：{upload_path}", access_token)
+                continue
+            if reason == "partial (accepted)":
+                logger.warning(f"[文件回传] 文件部分写入但仍发送: {upload_path}")
 
             # 按原始文件名 + 版本号重命名
             file_name = _derive_reply_filename(chat_id, raw_name)
             logger.info(f"[文件回传] 重命名 {raw_name} -> {file_name}")
 
-            # 上传
+            # 上传（内置重试）
             result = upload_file_to_feishu(upload_path, access_token, timeout=120, file_name=file_name)
             if result.get("success"):
-                send_file_message(chat_id, result["file_key"], file_name, access_token)
-                send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
+                file_key = result["file_key"]
+                send_result = send_file_message(chat_id, file_key, file_name, access_token)
+                if send_result.get("code") == 0:
+                    send_message(chat_id, f"✅ 文件已发送：{file_name}", access_token)
+                    logger.info(f"[文件回传] 完成: {p} -> {file_name}")
+                else:
+                    err = send_result.get("msg", "未知错误")
+                    send_message(chat_id, f"⚠️ 文件已上传但发送消息失败：{err}\nfile_key: {file_key}", access_token)
+                    logger.warning(f"[文件回传] 文件消息发送失败: {file_name} - {err}")
             else:
                 send_message(chat_id, f"⚠️ 文件已生成，但上传失败：{result.get('error', '未知错误')}\n本地路径：{upload_path}", access_token)
+                logger.error(f"[文件回传] 上传失败: {p} - {result.get('error')}")
         except Exception as e:
             send_message(chat_id, f"⚠️ 文件处理异常：{e}\n本地路径：{p}", access_token)
+            logger.error(f"[文件回传] 处理异常: {p} - {e}", exc_info=True)
 
 
 def _dispatch_to_session(chat_id: str, text: str, message_id: str, chat_type: str, target: str):
