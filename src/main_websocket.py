@@ -1248,6 +1248,44 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 send_message(chat_id, "📁 未设置工作空间，使用默认目录。", get_token())
             return
 
+        # ========== Plan A: 第一层文件索取检测 ==========
+        if _is_file_request(text):
+            filename = _extract_requested_filename(text)
+            if filename:
+                with _global_lock:
+                    if chat_id not in _main_sessions:
+                        session_id = get_session(chat_id) or ""
+                        ws = get_workspace(chat_id) or ""
+                        main = MainSession(chat_id=chat_id, session_id=session_id, workspace=ws)
+                        _main_sessions[chat_id] = main
+                        if chat_id not in _waiting_queue:
+                            _waiting_queue[chat_id] = Queue()
+
+                main = _main_sessions[chat_id]
+                workspace = main.workspace
+
+                candidates = _search_workspace_for_file(filename, workspace)
+                if not candidates:
+                    logger.info(f"[{chat_id[:8]}...] 文件索取但未找到: {filename}，转 Claude")
+                elif len(candidates) == 1:
+                    target = candidates[0]
+                    file_name = os.path.basename(target)
+                    send_message(chat_id, f"📎 找到文件：{file_name}", get_token())
+                    result = upload_file_to_feishu(target, get_token(), timeout=120, file_name=file_name)
+                    if result.get("success"):
+                        send_file_message(chat_id, result["file_key"], file_name, get_token())
+                        send_message(chat_id, f"✅ 已发送：{file_name}", get_token())
+                        logger.info(f"[{chat_id[:8]}...] 第一层直接上传: {file_name}")
+                    else:
+                        send_message(chat_id, f"⚠️ 上传失败：{result.get('error', '未知错误')}", get_token())
+                    return
+                else:
+                    logger.info(f"[{chat_id[:8]}...] 文件索取匹配 {len(candidates)} 个，发送选择卡片")
+                    _send_file_selection_card(chat_id, candidates, text, get_token(), workspace)
+                    return
+            else:
+                logger.info(f"[{chat_id[:8]}...] 识别为文件索取但未提取到文件名，转 Claude")
+
         # ========== 正常消息分发 ==========
         if _shutting_down:
             send_message(chat_id, "⚠️ 服务正在关闭，请稍后再试", get_token())
