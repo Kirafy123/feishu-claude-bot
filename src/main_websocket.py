@@ -197,6 +197,42 @@ PENDING_MERGE_SECONDS = 45
 _pending_attachments: dict[str, dict] = {}  # chat_id -> {paths, names, timer, message_id, chat_type, status_msg_id, workspace}
 _pending_lock = threading.Lock()
 
+# ========== 文件索取检测（Plan A） ==========
+
+# 文件索取意图关键词
+_FILE_REQUEST_PATTERNS = [
+    r'发.*给我',
+    r'发.*文件',
+    r'把.*文件.*发',
+    r'把.*发.*我',
+    r'下载.*文件',
+    r'给我.*文件',
+    r'发送.*文件',
+    r'发一下',
+    r'发我',
+    r'发过来',
+    r'发.*过来',
+    r'传给.*我',
+    r'传.*给.*我',
+    r'给.*我.*文件',
+    r'我要.*文件',
+    r'看看.*文件',
+    r'打开.*文件',
+]
+
+# 支持的文件扩展名
+_SUPPORTED_EXTENSIONS = (
+    '.xlsx', '.xls', '.doc', '.docx', '.pdf', '.ppt', '.pptx',
+    '.csv', '.txt', '.html', '.htm', '.json', '.xml', '.zip',
+    '.rar', '.7z', '.tar', '.gz', '.md', '.py', '.sql', '.log',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp',
+    '.mp4', '.mp3', '.wav', '.avi',
+)
+
+# 文件选择状态：chat_id -> {candidates, timer, original_text, access_token, workspace}
+_file_selection_state: dict[str, dict] = {}
+_file_selection_lock = threading.Lock()
+
 # 回传文件命名：记录每个 chat_id 最近上传的文件原始 stem 列表（FIFO，单任务最多挂 10 个）
 # 并给每个 stem 维护递增版本号，回传时重命名为 {stem}_v{NN}.{ext}
 _expected_reply_basenames: dict[str, list[str]] = {}  # chat_id -> [stem1, stem2, ...]
