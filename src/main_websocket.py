@@ -856,7 +856,14 @@ def _process_main_session(main: MainSession):
                         workspace=main.workspace,
                     )
 
-            reply, new_session_id, tool_calls = pc.chat_sync(message, on_heartbeat=on_heartbeat)
+            message_with_hint = (
+                message +
+                "\n\n【注意】如果你创建、生成或读取了文件，请在回复末尾明确写出"
+                "文件的完整路径，格式为：文件路径: /full/path/to/file.ext\n"
+                "如果用户要求发送某个文件但你没有直接上传，请在回复中提到该文件的完整路径。"
+            )
+
+            reply, new_session_id, tool_calls = pc.chat_sync(message_with_hint, on_heartbeat=on_heartbeat)
             done[0] = True
             if new_session_id != main.session_id:
                 main.session_id = new_session_id
@@ -958,7 +965,14 @@ def _process_parallel_session(parallel: ParallelSession):
             status_res = send_card_message(parallel.parent_chat_id, "🤔 思考中...", get_token(), workspace=parent_workspace)
             status_msg_id = status_res.get("data", {}).get("message_id", "")
 
-            reply, new_session_id, tool_calls = chat_sync(message, session_id=parallel.session_id, cwd=parent_workspace)
+            message_with_hint = (
+                message +
+                "\n\n【注意】如果你创建、生成或读取了文件，请在回复末尾明确写出"
+                "文件的完整路径，格式为：文件路径: /full/path/to/file.ext\n"
+                "如果用户要求发送某个文件但你没有直接上传，请在回复中提到该文件的完整路径。"
+            )
+
+            reply, new_session_id, tool_calls = chat_sync(message_with_hint, session_id=parallel.session_id, cwd=parent_workspace)
             if new_session_id != parallel.session_id:
                 parallel.session_id = new_session_id
 
