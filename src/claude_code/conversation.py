@@ -2,6 +2,8 @@
 Claude Code 连续对话客户端
 """
 import asyncio
+import os
+import subprocess
 import threading
 import time
 from typing import Optional, AsyncIterator
@@ -55,6 +57,44 @@ SYSTEM_PROMPT = """你是一个强大的本地电脑助手，拥有完整的系�
 - 如果指令不明确，做出合理推断并执行"""
 
 
+# ============================================================
+# Windows 子进程清理
+# ============================================================
+
+def _kill_process_tree_windows(pid: int) -> None:
+    """在 Windows 上杀死指定 PID 及其所有子进程。"""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
+def _find_and_kill_orphan_claude(exclude_pids: set[int]) -> None:
+    """扫描所有 claude.exe 进程，杀死不在 exclude_pids 中的。"""
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+            text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in out.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1])
+                    if pid not in exclude_pids:
+                        _kill_process_tree_windows(pid)
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+
+
 class ConversationClient:
     """
     连续对话客户端
@@ -105,12 +145,12 @@ class ConversationClient:
         """发送消息"""
         if not self._client:
             await self.connect()
-        
+
         await self._client.query(message)
-        
+
         response_text = []
         tool_calls = []
-        
+
         async for msg in self._client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -124,7 +164,7 @@ class ConversationClient:
                         })
             elif isinstance(msg, ResultMessage):
                 self.session_id = msg.session_id
-        
+
         return ChatResponse(
             content="\n".join(response_text),
             tool_calls=tool_calls,
@@ -151,15 +191,15 @@ def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[st
     """
     同步调用 Claude Code（在独立线程中运行，避免事件循环冲突）
 
-    Args:
-        message: 用户消息
-        session_id: 恢复之前的会话（可选）
-        cwd: 工作目录路径（可选）
-
-    Returns:
-        (回复内容, session_id, tool_calls)
+    防泄露策略：
+    - 每次调用前扫描并杀死无主的 claude.exe 残留进程
+    - 第一次重试用较短超时（300s），第二次用 600s
+    - 异常退出时强制杀死子进程树
     """
     import concurrent.futures
+
+    # 调用前清理无主 claude.exe
+    _cleanup_orphan_claude()
 
     def _run_in_thread(sid: str = None) -> tuple[str, str, list[dict]]:
         loop = asyncio.new_event_loop()
@@ -170,6 +210,10 @@ def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[st
                     r = await client.chat(message)
                     return r.content, r.session_id, r.tool_calls
             return loop.run_until_complete(_chat())
+        except Exception:
+            # 异常退出 → 可能留下子进程，强制清理
+            # 注意：这里拿不到 PID，但 _cleanup_orphan_claude 下次调用会处理
+            raise
         finally:
             loop.close()
 
@@ -177,7 +221,7 @@ def chat_sync(message: str, session_id: str = None, cwd: str = None) -> tuple[st
     try:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(_run_in_thread, session_id)
-            return future.result(timeout=600)
+            return future.result(timeout=300)  # 重试路径用较短超时
     except Exception:
         # session_id 无效/不存在，清空后重试
         session_id = None
@@ -220,9 +264,10 @@ class PersistentClient:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Optional[ClaudeSDKClient] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock 允许同一线程重复获取
         self._idle_timer: Optional[threading.Timer] = None
         self._connected = False
+        self._in_use = False  # 标记是否有 chat 操作正在进行
 
     def _ensure_loop(self):
         """确保事件循环存在"""
@@ -243,9 +288,30 @@ class PersistentClient:
         self._idle_timer.daemon = True
         self._idle_timer.start()
 
-    def _idle_disconnect(self):
-        """空闲超时断开"""
+    def _kill_process_tree(self):
+        """通过 SDK transport 拿到真实 PID，强制杀死整个进程树。"""
         with self._lock:
+            client = self._client
+        if client is None:
+            return
+        transport = getattr(client, "_transport", None)
+        if transport is None:
+            return
+        proc = getattr(transport, "_process", None)
+        if proc is None:
+            return
+        try:
+            pid = proc.pid
+            _kill_process_tree_windows(pid)
+        except Exception:
+            pass
+
+    def _idle_disconnect(self):
+        """空闲超时断开 — 仅在无操作进行时才断开。"""
+        with self._lock:
+            # 有 chat 正在进行 → 不断开
+            if self._in_use:
+                return
             if not self._connected or self._client is None:
                 return
             client = self._client
@@ -258,6 +324,7 @@ class PersistentClient:
             asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=10)
         except Exception:
             pass
+        self._kill_process_tree()
 
     def connect(self):
         """连接客户端"""
@@ -285,6 +352,10 @@ class PersistentClient:
             self.connect()
 
         self._reset_idle_timer()
+
+        # 标记为使用中，阻止 idle_disconnect
+        with self._lock:
+            self._in_use = True
 
         self._heartbeat_timer: Optional[threading.Timer] = None
         if on_heartbeat:
@@ -321,6 +392,8 @@ class PersistentClient:
             if self._heartbeat_timer:
                 self._heartbeat_timer.cancel()
                 self._heartbeat_timer = None
+            with self._lock:
+                self._in_use = False
 
     def _do_chat_sync(self, message: str) -> tuple[str, str, list[dict]]:
         """实际执行聊天（无重试），返回 (回复文本, session_id, tool_calls)"""
@@ -350,6 +423,47 @@ class PersistentClient:
         future = asyncio.run_coroutine_threadsafe(_do_chat(), loop)
         return future.result(timeout=1800)
 
+    def check_alive(self) -> bool:
+        """检测底层 Claude 子进程是否存活。
+
+        优先级：SDK transport 内部 _process → 按 session_id 匹配 claude.exe 进程。
+        线程安全，可在心跳回调中调用。
+        """
+        with self._lock:
+            if not self._connected or self._client is None:
+                return False
+            client = self._client
+
+        # 方式1：检查 SDK transport 内部 subprocess
+        transport = getattr(client, "_transport", None)
+        if transport is not None:
+            proc = getattr(transport, "_process", None)
+            if proc is not None:
+                try:
+                    ret = proc.poll()
+                    return ret is None  # None = 仍在运行
+                except Exception:
+                    pass
+
+        # 方式2：按 session_id 模糊匹配系统进程
+        if self.session_id:
+            try:
+                out = subprocess.check_output(
+                    ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+                    text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return self.session_id[:8] in out
+            except Exception:
+                pass
+
+        return True  # 无法检测时保守返回 True
+
+    @property
+    def client(self):
+        """返回底层 SDK 客户端引用（只读，供外部做细粒度检查）"""
+        with self._lock:
+            return self._client
+
     def disconnect(self):
         """主动断开连接"""
         if self._idle_timer:
@@ -361,7 +475,67 @@ class PersistentClient:
             client = self._client
             self._client = None
             self._connected = False
+            self._in_use = False  # 重置使用状态
         try:
             asyncio.run_coroutine_threadsafe(client.disconnect(), self._loop).result(timeout=10)
         except Exception:
             pass
+        self._kill_process_tree()
+
+
+# ============================================================
+# 无主进程清理
+# ============================================================
+
+def _cleanup_orphan_claude() -> None:
+    """扫描所有 claude.exe 进程，杀死没有对应 Python 父进程的子进程。"""
+    if os.name != "nt":
+        return
+    try:
+        # 获取所有 python/pythonw/python3.12 进程的 PID
+        py_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        pyw_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq pythonw.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        py3_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq python3.12.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        pyw3_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq pythonw3.12.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+
+        parent_pids: set[int] = set()
+        for output in [py_out, pyw_out, py3_out, pyw3_out]:
+            for line in output.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = [p.strip().strip('"') for p in line.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        parent_pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+
+        # 获取所有 claude.exe 进程及其 PPID
+        cl_out = subprocess.check_output(
+            ["wmic", "process", "where", "name='claude.exe'", "get", "ProcessId,ParentProcessId"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        for line in cl_out.strip().split("\n")[1:]:  # 跳过表头
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    claude_pid = int(parts[0])
+                    claude_ppid = int(parts[1])
+                    if claude_ppid not in parent_pids:
+                        _kill_process_tree_windows(claude_pid)
+                except ValueError:
+                    pass
+    except Exception:
+        pass

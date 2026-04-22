@@ -15,6 +15,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+import glob
 import json
 import logging
 import re
@@ -30,7 +31,7 @@ import lark_oapi as lark
 from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
-from src.claude_code import chat_sync, PersistentClient
+from src.claude_code import chat_sync, PersistentClient, _cleanup_orphan_claude
 from src.feishu_utils.feishu_utils import (
     send_message, reply_message, update_card_message, send_card_message,
     download_file_message, upload_file_to_feishu, send_file_message, zip_folder
@@ -318,6 +319,9 @@ def shutdown() -> dict:
         f"[shutdown] 清理完成: 主会话任务={cancelled_main}, "
         f"并行会话任务={cancelled_parallel}, 等待队列={cleared_waiting}"
     )
+
+    # 断开后最后扫一遍残留孤儿进程（父进程已被 kill）
+    _cleanup_orphan_claude()
     return {
         "cancelled_main": cancelled_main,
         "cancelled_parallel": cancelled_parallel,
@@ -1023,6 +1027,28 @@ def _process_main_session(main: MainSession):
                 if done[0]:
                     return
                 elapsed[0] += 30
+                # 检测 Claude 子进程是否存活
+                if not pc.check_alive():
+                    done[0] = True
+                    main.persistent_client = None
+                    try:
+                        if status_msg_id:
+                            update_card_message(
+                                status_msg_id,
+                                "❌ Claude 进程异常终止，请简化任务后重试。",
+                                get_token(),
+                                workspace=main.workspace,
+                            )
+                        else:
+                            send_message(
+                                main.chat_id,
+                                "❌ Claude 进程异常终止，请简化任务后重试。",
+                                get_token(),
+                            )
+                    except Exception:
+                        pass
+                    logger.error(f"[主会话] Claude 进程已死亡 [{main.chat_id[:8]}...]")
+                    return
                 if status_msg_id:
                     update_card_message(
                         status_msg_id,
@@ -1534,6 +1560,7 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
 
 def main():
+    _cleanup_orphan_claude()  # 启动前清理残留的 claude.exe 孤儿进程
     while True:
         try:
             client = lark.ws.Client(
