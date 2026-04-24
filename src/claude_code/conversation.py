@@ -60,25 +60,44 @@ SYSTEM_PROMPT = """你是一个强大的本地电脑助手，拥有完整的系�
 # ============================================================
 # Windows 子进程清理
 # ============================================================
+# 策略：
+# - 启动时记录已存在的 claude.exe PID，这些一律不杀（包含用户手动开的）
+# - 只杀"父 Python 进程已不存在"的真正孤儿
+# - 不杀父进程为终端程序（cmd/powershell/WT 等）的 claude.exe
 
-def _kill_process_tree_windows(pid: int) -> None:
-    """在 Windows 上杀死指定 PID 及其所有子进程。"""
+# 启动时已存在的 claude.exe PID，永不杀死
+_known_claude_pids: set[int] = set()
+
+# 终端程序名称（不杀这些父进程下的 claude）
+_TERMINAL_NAMES = frozenset([
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "WindowsTerminal.exe", "conhost.exe",
+    "wt.exe", "ms-terminal.exe",
+    "Explorer.EXE",  # 双击启动的
+])
+
+
+def _get_parent_process_name(ppid: int) -> str:
+    """获取指定 PID 的进程名称，失败返回空字符串。"""
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            capture_output=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+        out = subprocess.check_output(
+            ["wmic", "process", "where", f"ProcessId={ppid}", "get", "Name"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
         )
+        lines = out.strip().split("\n")
+        return lines[1].strip() if len(lines) >= 2 else ""
     except Exception:
-        pass
+        return ""
 
 
-def _find_and_kill_orphan_claude(exclude_pids: set[int]) -> None:
-    """扫描所有 claude.exe 进程，杀死不在 exclude_pids 中的。"""
+def _init_known_claude_pids() -> None:
+    """启动时记录已有的 claude.exe PID，防止误杀用户手动开的会话。"""
+    global _known_claude_pids
+    _known_claude_pids.clear()
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
-            text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
         )
         for line in out.strip().split("\n"):
             if not line.strip():
@@ -86,9 +105,87 @@ def _find_and_kill_orphan_claude(exclude_pids: set[int]) -> None:
             parts = [p.strip().strip('"') for p in line.split(",")]
             if len(parts) >= 2:
                 try:
-                    pid = int(parts[1])
-                    if pid not in exclude_pids:
-                        _kill_process_tree_windows(pid)
+                    _known_claude_pids.add(int(parts[1]))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+
+
+def register_claude_pid(pid: int) -> None:
+    """注册由本 bot 创建的 claude.exe PID。"""
+    _known_claude_pids.add(pid)
+
+
+def _cleanup_orphan_claude() -> None:
+    """扫描所有 claude.exe 进程，只杀死父 Python 进程已退出的真正孤儿。
+
+    以下情况不杀：
+    - 启动时已存在的 PID（含用户手动开的）
+    - 父进程是终端程序
+    - 父进程仍在运行
+    """
+    if os.name != "nt":
+        return
+    try:
+        # 获取所有 python/pythonw 进程的 PID
+        py_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        pyw_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq pythonw.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        py3_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq python3.12.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        pyw3_out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq pythonw3.12.exe", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+
+        parent_pids: set[int] = set()
+        for output in [py_out, pyw_out, py3_out, pyw3_out]:
+            for line in output.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = [p.strip().strip('"') for p in line.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        parent_pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+
+        # 获取所有 claude.exe 进程及其 PPID
+        cl_out = subprocess.check_output(
+            ["wmic", "process", "where", "name='claude.exe'", "get", "ProcessId,ParentProcessId"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        for line in cl_out.strip().split("\n")[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    claude_pid = int(parts[0])
+                    claude_ppid = int(parts[1])
+
+                    # 启动时已存在的 → 不杀
+                    if claude_pid in _known_claude_pids:
+                        continue
+
+                    # 父进程是终端程序 → 不杀
+                    pname = _get_parent_process_name(claude_ppid)
+                    if pname in _TERMINAL_NAMES:
+                        continue
+
+                    # 父进程仍在运行 → 不杀
+                    if claude_ppid in parent_pids:
+                        continue
+
+                    # 父进程已不存在（或为 0/4 等系统进程） → 真正的孤儿，杀
+                    if claude_ppid == 0 or claude_ppid == 4 or pname == "":
+                        _kill_process_tree_windows(claude_pid)
                 except ValueError:
                     pass
     except Exception:
@@ -131,15 +228,30 @@ class ConversationClient:
         self._client: Optional[ClaudeSDKClient] = None
 
     async def connect(self):
+        stderr_capture: list[str] = []
+        def _stderr_cb(msg: str) -> None:
+            stderr_capture.append(msg)
         options = ClaudeAgentOptions(
             resume=self._initial_session_id,
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
             system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
             cwd=self.cwd,
+            stderr=_stderr_cb,
         )
         self._client = ClaudeSDKClient(options=options)
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception:
+            stderr_text = "".join(stderr_capture)
+            if "No conversation found" in stderr_text or "terminated" in stderr_text.lower():
+                self._initial_session_id = None
+                self.session_id = None
+                options.resume = None
+                self._client = ClaudeSDKClient(options=options)
+                await self._client.connect()
+            else:
+                raise
 
     async def chat(self, message: str) -> ChatResponse:
         """发送消息"""
@@ -254,6 +366,7 @@ class PersistentClient:
         allowed_tools: list[str] = None,
         permission_mode: str = "bypassPermissions",
         system_prompt: str = None,
+        on_session_changed: Optional[callable] = None,
     ):
         self.session_id = session_id
         self.cwd = cwd
@@ -261,6 +374,7 @@ class PersistentClient:
         self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
         self.permission_mode = permission_mode
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+        self.on_session_changed = on_session_changed
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Optional[ClaudeSDKClient] = None
@@ -327,24 +441,50 @@ class PersistentClient:
         self._kill_process_tree()
 
     def connect(self):
-        """连接客户端"""
+        """连接客户端，旧 session 过期时自动重连"""
         with self._lock:
             if self._connected:
                 return
             self._ensure_loop()
+        self._connect_inner()
 
-            options = ClaudeAgentOptions(
-                resume=self.session_id,
-                allowed_tools=self.allowed_tools,
-                permission_mode=self.permission_mode,
-                system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
-                cwd=self.cwd,
-            )
-            client = ClaudeSDKClient(options=options)
-            future = asyncio.run_coroutine_threadsafe(client.connect(), self._loop)
-            future.result(timeout=30)
-            self._client = client
-            self._connected = True
+    def _connect_inner(self, retry: bool = False):
+        """实际连接逻辑，支持一次重试"""
+        stderr_capture: list[str] = []
+
+        def _stderr_cb(msg: str) -> None:
+            stderr_capture.append(msg)
+
+        try:
+            with self._lock:
+                options = ClaudeAgentOptions(
+                    resume=self.session_id,
+                    allowed_tools=self.allowed_tools,
+                    permission_mode=self.permission_mode,
+                    system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
+                    cwd=self.cwd,
+                    stderr=_stderr_cb,
+                )
+                client = ClaudeSDKClient(options=options)
+                future = asyncio.run_coroutine_threadsafe(client.connect(), self._loop)
+                future.result(timeout=30)
+                with self._lock:
+                    self._client = client
+                    self._connected = True
+        except Exception:
+            stderr_text = "".join(stderr_capture)
+            if not retry and ("No conversation found" in stderr_text or "terminated" in stderr_text.lower()):
+                # 旧 session 过期/不存在 → 清除后重试
+                with self._lock:
+                    self.session_id = None
+                if self.on_session_changed:
+                    try:
+                        self.on_session_changed(None)
+                    except Exception:
+                        pass
+                self._connect_inner(retry=True)
+            else:
+                raise
 
     def chat_sync(self, message: str, on_heartbeat: Optional[callable] = None) -> tuple[str, str, list[dict]]:
         """发送消息并等待回复，session 失效时自动重试"""
@@ -382,6 +522,11 @@ class PersistentClient:
                     "terminated" in error_msg.lower()):
                 self.disconnect()
                 self.session_id = None
+                if self.on_session_changed:
+                    try:
+                        self.on_session_changed(None)
+                    except Exception:
+                        pass
                 time.sleep(2)
                 self.connect()
                 result = self._do_chat_sync(message)
@@ -400,6 +545,7 @@ class PersistentClient:
         with self._lock:
             client = self._client
             loop = self._loop
+            old_session_id = self.session_id
 
         async def _do_chat():
             await client.query(message)
@@ -421,7 +567,16 @@ class PersistentClient:
             return "\n".join(response_text), self.session_id or "", tool_calls
 
         future = asyncio.run_coroutine_threadsafe(_do_chat(), loop)
-        return future.result(timeout=1800)
+        content, new_sid, tool_calls = future.result(timeout=600)
+
+        # session_id 变更时通知调用方（持久化到 DB）
+        if new_sid and new_sid != old_session_id and self.on_session_changed:
+            try:
+                self.on_session_changed(new_sid)
+            except Exception:
+                pass
+
+        return content, new_sid, tool_calls
 
     def check_alive(self) -> bool:
         """检测底层 Claude 子进程是否存活。
@@ -481,61 +636,3 @@ class PersistentClient:
         except Exception:
             pass
         self._kill_process_tree()
-
-
-# ============================================================
-# 无主进程清理
-# ============================================================
-
-def _cleanup_orphan_claude() -> None:
-    """扫描所有 claude.exe 进程，杀死没有对应 Python 父进程的子进程。"""
-    if os.name != "nt":
-        return
-    try:
-        # 获取所有 python/pythonw/python3.12 进程的 PID
-        py_out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
-        )
-        pyw_out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq pythonw.exe", "/FO", "CSV", "/NH"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
-        )
-        py3_out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq python3.12.exe", "/FO", "CSV", "/NH"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
-        )
-        pyw3_out = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq pythonw3.12.exe", "/FO", "CSV", "/NH"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
-        )
-
-        parent_pids: set[int] = set()
-        for output in [py_out, pyw_out, py3_out, pyw3_out]:
-            for line in output.strip().split("\n"):
-                if not line.strip():
-                    continue
-                parts = [p.strip().strip('"') for p in line.split(",")]
-                if len(parts) >= 2:
-                    try:
-                        parent_pids.add(int(parts[1]))
-                    except ValueError:
-                        pass
-
-        # 获取所有 claude.exe 进程及其 PPID
-        cl_out = subprocess.check_output(
-            ["wmic", "process", "where", "name='claude.exe'", "get", "ProcessId,ParentProcessId"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
-        )
-        for line in cl_out.strip().split("\n")[1:]:  # 跳过表头
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    claude_pid = int(parts[0])
-                    claude_ppid = int(parts[1])
-                    if claude_ppid not in parent_pids:
-                        _kill_process_tree_windows(claude_pid)
-                except ValueError:
-                    pass
-    except Exception:
-        pass

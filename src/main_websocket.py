@@ -12,6 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
+import logging
+import logging.handlers
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -31,7 +33,7 @@ import lark_oapi as lark
 from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
-from src.claude_code import chat_sync, PersistentClient, _cleanup_orphan_claude
+from src.claude_code import chat_sync, PersistentClient, _cleanup_orphan_claude, _init_known_claude_pids
 from src.feishu_utils.feishu_utils import (
     send_message, reply_message, update_card_message, send_card_message,
     download_file_message, upload_file_to_feishu, send_file_message, zip_folder
@@ -45,18 +47,37 @@ DEFAULT_DOWNLOAD_DIR = str(Path(__file__).parent.parent / "data" / "downloads")
 
 MAX_PARALLEL_SESSIONS = 2  # 最多 2 个并行会话
 MAX_WAITING_QUEUE = 3       # 等待队列最多 3 条
+MAX_SESSION_QUEUE = 10      # 会话队列最大容量
 
 # 强制 UTF-8 输出，避免 Windows GBK 乱码
 sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
 sys.stderr.reconfigure(encoding='utf-8') if hasattr(sys.stderr, 'reconfigure') else None
 
+# 日志重定向到文件（RotatingFileHandler，5MB * 3 备份）
+_logs_dir = str(Path(__file__).parent.parent / "logs")
+os.makedirs(_logs_dir, exist_ok=True)
+_log_file = os.path.join(_logs_dir, "service.log")
+_file_handler = logging.handlers.RotatingFileHandler(
+    _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8',
+)
+_file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(message)s',
+    format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s',
     force=True,
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[_file_handler, _console_handler]
 )
 logger = logging.getLogger(__name__)
+
+# 将 stderr 也重定向到日志文件（捕获 SDK 的 stderr 输出）
+_stderr_log = os.path.join(_logs_dir, "service_stderr.log")
+_stderr_handler = logging.handlers.RotatingFileHandler(
+    _stderr_log, maxBytes=5 * 1024 * 1024, backupCount=1, encoding='utf-8',
+)
+sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', encoding='utf-8', buffering=1)  # line-buffered
 
 # ---------- 连接状态跟踪 ----------
 _known_chat_ids: set[str] = set()
@@ -149,7 +170,7 @@ class MainSession:
     chat_id: str
     session_id: str
     busy: bool = False
-    queue: Queue = field(default_factory=Queue)
+    queue: Queue = field(default_factory=lambda: Queue(maxsize=MAX_SESSION_QUEUE))
     thread: Optional[threading.Thread] = None
     log_file: str = ""
     workspace: str = ""
@@ -168,10 +189,18 @@ class MainSession:
     def get_persistent_client(self) -> PersistentClient:
         """获取或创建持久客户端"""
         if self.persistent_client is None:
+            chat_id = self.chat_id
+            def _on_session_id_changed(new_sid: str):
+                """session_id 变更时持久化到 DB"""
+                try:
+                    save_session(chat_id, new_sid)
+                except Exception as e:
+                    logger.error(f"[{chat_id[:8]}...] 保存 session_id 失败: {e}")
             self.persistent_client = PersistentClient(
                 session_id=self.session_id if self.session_id else None,
                 cwd=self.workspace if self.workspace else None,
                 idle_timeout=1920,  # 32分钟无消息自动断开
+                on_session_changed=_on_session_id_changed,
             )
         return self.persistent_client
 
@@ -182,7 +211,7 @@ class ParallelSession:
     session_id: str
     parent_chat_id: str
     busy: bool = False
-    queue: Queue = field(default_factory=Queue)
+    queue: Queue = field(default_factory=lambda: Queue(maxsize=MAX_SESSION_QUEUE))
     thread: Optional[threading.Thread] = None
 
 
@@ -361,8 +390,9 @@ def _handle_signal(signum, frame):
 
 
 # 注册信号处理（仅主线程有效）
-if hasattr(signal, 'SIGTERM'):
-    signal.signal(signal.SIGTERM, _handle_signal)
+# Windows 上 SIGTERM 不可靠，用 SIGBREAK（Ctrl+Break）代替
+if os.name == 'nt' and hasattr(signal, 'SIGBREAK'):
+    signal.signal(signal.SIGBREAK, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
@@ -1272,10 +1302,11 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 logger.info(f"[{chat_id[:8]}...] 消息 {message_id[:8]}... 已处理过，忽略重复")
                 return
             _processed_messages.add(message_id)
-            # 限制集合大小，避免内存泄漏
+            # 限制集合大小，避免内存泄漏：只删最老的 500 条
             if len(_processed_messages) > 1000:
-                _processed_messages.clear()
-                _processed_messages.add(message_id)
+                to_remove = list(_processed_messages)[:500]
+                for old_id in to_remove:
+                    _processed_messages.discard(old_id)
         chat_type = message.chat_type
         message_type = message.message_type
 
@@ -1466,10 +1497,14 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
             save_workspace(chat_id, workspace_path)
 
-            # 更新已存在的主会话
+            # 更新已存在的主会话，并重建 PersistentClient（cwd 已变）
             with _global_lock:
                 if chat_id in _main_sessions:
-                    _main_sessions[chat_id].workspace = workspace_path
+                    main = _main_sessions[chat_id]
+                    main.workspace = workspace_path
+                    if main.persistent_client:
+                        main.persistent_client.disconnect()
+                        main.persistent_client = None
 
             send_message(chat_id, f"✅ 工作空间已设置：{workspace_path}\n\n后续对话将在此目录下进行。", get_token())
             logger.info(f"[{chat_id[:8]}...] 工作空间设置: {workspace_path}")
@@ -1559,8 +1594,61 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         logger.error(f"处理消息失败: {e}")
 
 
+def _write_pid_file():
+    """将当前进程 PID 写入 .pid 文件，供 stop.bat / restart.bat 使用。"""
+    pid_file = Path(__file__).parent.parent / ".pid"
+    try:
+        pid_file.write_text(str(os.getpid()), encoding='utf-8')
+    except Exception as e:
+        logger.error(f"写入 PID 文件失败: {e}")
+
+
+def _check_duplicate_instance() -> bool:
+    """检查是否已有实例在运行。返回 True 表示重复。"""
+    pid_file = Path(__file__).parent.parent / ".pid"
+    if not pid_file.exists():
+        return False
+    try:
+        old_pid = int(pid_file.read_text(encoding='utf-8').strip())
+        # 检查该 PID 是否存活
+        import subprocess
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {old_pid}", "/FO", "CSV", "/NH"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        # tasklist 找不到 PID 时会返回 "INFO: No tasks running with the specified criteria."
+        # 只有真正找到进程才返回 CSV 行
+        if "No tasks" in out or not out.strip():
+            return False
+        # 确认是 python 进程
+        if "python" in out.lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def main():
-    _cleanup_orphan_claude()  # 启动前清理残留的 claude.exe 孤儿进程
+    # 检查重复实例
+    if _check_duplicate_instance():
+        logger.error("服务已在运行，请先停止后再启动")
+        sys.exit(1)
+
+    # 写 PID 文件
+    _write_pid_file()
+
+    # 验证配置
+    if not APP_ID or not APP_SECRET:
+        logger.error("APP_ID 和 APP_SECRET 未设置，请检查 .env 文件")
+        sys.exit(1)
+
+    _init_known_claude_pids()   # 记录已存在的 claude.exe（含用户手动开的），不杀
+    _cleanup_orphan_claude()    # 只清理父进程已退出的真正孤儿
+
+    # 指数退避重连参数
+    reconnect_delay = 5    # 初始 5 秒
+    max_reconnect_delay = 300  # 最大 300 秒
+
     while True:
         try:
             client = lark.ws.Client(
@@ -1574,15 +1662,23 @@ def main():
 
             logger.info("启动飞书长连接...")
             client.start()
+            # 连接成功 → 重置退避时间
+            reconnect_delay = 5
 
         except Exception as e:
             logger.error(f"长连接异常退出: {e}")
         finally:
             with _ws_lock:
                 _ws_connected = False
+            # 异常断开时清理
+            try:
+                _cleanup_orphan_claude()
+            except Exception:
+                pass
 
-        logger.info("5秒后重连...")
-        time.sleep(5)
+        logger.info(f"{reconnect_delay} 秒后重连...")
+        time.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
 if __name__ == "__main__":

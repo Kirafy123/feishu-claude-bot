@@ -2,18 +2,28 @@
 cd /d "%~dp0"
 
 :: ============================================
-:: One-click restart: kill -> clear cache -> start
+:: One-click restart: kill own PID -> clear cache -> start
 :: ============================================
 
 set TASKKILL=C:\Windows\System32\taskkill.exe
 set TASKLIST=C:\Windows\System32\tasklist.exe
 
-:: 1. Kill old processes (pythonw / python variants)
+:: 1. Kill own process (use .pid file if available)
 echo [1/3] Stopping old service...
-%TASKKILL% /f /im pythonw.exe >nul 2>&1
-%TASKKILL% /f /im pythonw3.11.exe >nul 2>&1
-%TASKKILL% /f /im pythonw3.12.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+if exist .pid (
+    set /p pid=<.pid
+    del /q .pid >nul 2>&1
+    %TASKKILL% /pid %pid% /f >nul 2>&1
+    timeout /t 2 /nobreak >nul
+) else (
+    echo .pid file not found, searching for pythonw.exe with our module...
+    :: Fallback: find pythonw.exe running our module by checking command line
+    for /f "tokens=2" %%a in ('tasklist /fi "imagename eq pythonw.exe" /fo csv /nh 2^>nul') do (
+        set /p pid=%%~a <nul
+        %TASKKILL% /pid %%~a /f >nul 2>&1
+    )
+    timeout /t 2 /nobreak >nul
+)
 
 :: 2. Clear Python cache
 echo [2/3] Clearing cache...
