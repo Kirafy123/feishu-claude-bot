@@ -61,23 +61,26 @@ _file_handler = logging.handlers.RotatingFileHandler(
     _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8',
 )
 _file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+_log_handlers = [_file_handler]
+if sys.stdout is not None:
+    _console_handler = logging.StreamHandler(sys.stdout)
+    _console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+    _log_handlers.append(_console_handler)
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [%(threadName)s] %(message)s',
     force=True,
-    handlers=[_file_handler, _console_handler]
+    handlers=_log_handlers
 )
 logger = logging.getLogger(__name__)
 
-# 将 stderr 也重定向到日志文件（捕获 SDK 的 stderr 输出）
-_stderr_log = os.path.join(_logs_dir, "service_stderr.log")
-_stderr_handler = logging.handlers.RotatingFileHandler(
-    _stderr_log, maxBytes=5 * 1024 * 1024, backupCount=1, encoding='utf-8',
-)
-sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', encoding='utf-8', buffering=1)  # line-buffered
+# pythonw.exe 下 sys.stderr 为 None，安全包装避免崩溃
+if sys.stderr is not None:
+    try:
+        sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', encoding='utf-8', buffering=1)
+    except Exception:
+        pass
 
 # ---------- 连接状态跟踪 ----------
 _known_chat_ids: set[str] = set()
@@ -86,6 +89,9 @@ _chat_ids_lock = threading.Lock()
 _token_cache: dict = {"token": None, "time": 0}
 _ws_connected = False
 _ws_lock = threading.Lock()
+_ws_disconnect_since: Optional[float] = None  # 上次断线时间，None 表示当前已连接或从未连接过
+_ws_reconnect_time: float = 0.0            # 最近一次重连（非首连）的时刻
+_last_reconnect_notify_time: float = 0.0   # 限流：上次发重连通知的时刻
 _first_connect_notified = False
 _first_connect_lock = threading.Lock()
 
@@ -136,23 +142,38 @@ class FeishuLogHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = record.getMessage()
-            global _ws_connected
+            global _ws_connected, _ws_disconnect_since, _ws_reconnect_time
+            global _first_connect_notified, _last_reconnect_notify_time
             if "connected to wss://" in msg:
                 with _ws_lock:
                     was_connected = _ws_connected
                     _ws_connected = True
+                    _ws_disconnect_since = None
                 if not was_connected:
-                    global _first_connect_notified
+                    now = time.time()
                     with _first_connect_lock:
                         if not _first_connect_notified:
+                            # 首次上线
                             _first_connect_notified = True
                             def _notify():
                                 time.sleep(2)
                                 notify_all_chats("🟢 Claude Code 已上线，可以开始使用")
                             threading.Thread(target=_notify, daemon=True).start()
+                        else:
+                            # 重连：记录重连时刻，并发通知（限流 5 分钟一次）
+                            _ws_reconnect_time = now
+                            if now - _last_reconnect_notify_time > 300:
+                                _last_reconnect_notify_time = now
+                                def _reconnect_notify():
+                                    time.sleep(2)
+                                    notify_all_chats("🟢 服务已重连，之前的消息将自动继续处理")
+                                threading.Thread(target=_reconnect_notify, daemon=True).start()
             elif "receive message loop exit" in msg or "disconnect" in msg.lower():
                 with _ws_lock:
+                    was_connected = _ws_connected
                     _ws_connected = False
+                    if was_connected and _ws_disconnect_since is None:
+                        _ws_disconnect_since = time.time()
         except Exception:
             pass
 
@@ -266,13 +287,6 @@ _SUPPORTED_EXTENSIONS = (
 # 文件选择状态：chat_id -> {candidates, timer, original_text, access_token, workspace}
 _file_selection_state: dict[str, dict] = {}
 _file_selection_lock = threading.Lock()
-
-# 回传文件命名：记录每个 chat_id 最近上传的文件原始 stem 列表（FIFO，单任务最多挂 10 个）
-# 并给每个 stem 维护递增版本号，回传时重命名为 {stem}_v{NN}.{ext}
-_expected_reply_basenames: dict[str, list[str]] = {}  # chat_id -> [stem1, stem2, ...]
-_reply_version_counter: dict[tuple, int] = {}  # (chat_id, stem) -> next version
-_reply_name_lock = threading.Lock()
-
 
 def _cancel_all_tasks(chat_id: str) -> int:
     """
@@ -548,39 +562,9 @@ def _collect_file_paths(reply_text: str, tool_calls: list[dict], workspace: str 
     return unique
 
 
-def _derive_reply_filename(chat_id: str, original_basename: str) -> str:
-    """根据 chat_id 记录的原始上传文件 stem，为回传文件生成 {stem}_v{NN}.{ext} 命名。
-    匹配规则：
-      1) 回传文件名的 stem 就在列表里 → 用该 stem
-      2) 回传文件名包含任一原 stem 作为子串 → 用该 stem
-      3) 列表只有一个 stem → 直接用它（最常见的"处理这个文件"场景）
-      4) 都不匹配 → 保留原名（去掉我们加的 chat_id_timestamp_ 前缀，如果有）
-    版本号按 (chat_id, stem) 递增，从 01 开始。
-    """
+def _derive_reply_filename(original_basename: str) -> str:
+    """回传文件名：直接用 Claude 生成的文件名，去掉飞书下载的 oc_xxx_时间戳_ 前缀。"""
     base = os.path.basename(original_basename)
-    stem, ext = os.path.splitext(base)
-
-    with _reply_name_lock:
-        candidates = list(_expected_reply_basenames.get(chat_id, []))
-        matched_stem = None
-        if candidates:
-            if stem in candidates:
-                matched_stem = stem
-            else:
-                for c in candidates:
-                    if c and c in stem:
-                        matched_stem = c
-                        break
-                if matched_stem is None and len(candidates) == 1:
-                    matched_stem = candidates[0]
-
-        if matched_stem:
-            key = (chat_id, matched_stem)
-            ver = _reply_version_counter.get(key, 0) + 1
-            _reply_version_counter[key] = ver
-            return f"{matched_stem}_v{ver:02d}{ext}"
-
-    # 去掉 "chat_id_timestamp_" 前缀（如果是我们下载存下的）
     m = re.match(r'^oc_[0-9a-f]+_\d+_(.+)$', base)
     if m:
         return m.group(1)
@@ -718,7 +702,7 @@ def _send_files_after_reply(chat_id: str, reply_text: str, access_token: str, to
                 logger.warning(f"[文件回传] 文件部分写入但仍发送: {upload_path}")
 
             # 按原始文件名 + 版本号重命名
-            file_name = _derive_reply_filename(chat_id, raw_name)
+            file_name = _derive_reply_filename(raw_name)
             logger.info(f"[文件回传] 重命名 {raw_name} -> {file_name}")
 
             # 上传（内置重试）
@@ -990,15 +974,6 @@ def _flush_pending_attachment(chat_id: str, extra_text: str = "") -> None:
         except Exception:
             pass
 
-    # 记录原始文件 stem，供回传时命名参考
-    with _reply_name_lock:
-        stems = []
-        for n in names:
-            stem, _ext = os.path.splitext(n)
-            if stem:
-                stems.append(stem)
-        _expected_reply_basenames[chat_id] = stems
-
     main = _main_sessions.get(chat_id)
     if main:
         main.log_message("user", synthetic_text[:200], session_tag="file-merged" if extra_text.strip() else "file-timeout")
@@ -1045,7 +1020,10 @@ def _process_main_session(main: MainSession):
         main.log_message("user", message, session_tag="main")
 
         try:
-            status_res = send_card_message(main.chat_id, "🤔 思考中...", get_token(), workspace=main.workspace)
+            # 如果距上次重连不超过 5 分钟，说明此消息可能是断线期间积压的，提示用户
+            recently_reconnected = _ws_reconnect_time > 0 and (time.time() - _ws_reconnect_time < 300)
+            initial_text = "🔄 刚刚重启，正在处理你的消息..." if recently_reconnected else "🤔 思考中..."
+            status_res = send_card_message(main.chat_id, initial_text, get_token(), workspace=main.workspace)
             status_msg_id = status_res.get("data", {}).get("message_id", "")
 
             # 使用持久客户端
@@ -1087,6 +1065,21 @@ def _process_main_session(main: MainSession):
                         workspace=main.workspace,
                     )
 
+            def on_reconnect():
+                """Claude 子进程崩溃，PersistentClient 正在重连时回调"""
+                if done[0]:
+                    return
+                try:
+                    if status_msg_id:
+                        update_card_message(
+                            status_msg_id,
+                            "🔄 Claude 连接中断，正在重连...",
+                            get_token(),
+                            workspace=main.workspace,
+                        )
+                except Exception:
+                    pass
+
             message_with_hint = (
                 message +
                 "\n\n【注意】如果你创建、生成或读取了文件，请在回复末尾明确写出"
@@ -1094,8 +1087,20 @@ def _process_main_session(main: MainSession):
                 "如果用户要求发送某个文件但你没有直接上传，请在回复中提到该文件的完整路径。"
             )
 
-            reply, new_session_id, tool_calls = pc.chat_sync(message_with_hint, on_heartbeat=on_heartbeat)
+            reply, new_session_id, tool_calls = pc.chat_sync(message_with_hint, on_heartbeat=on_heartbeat, on_reconnect=on_reconnect)
             done[0] = True
+
+            # session 含 thinking 签名等 API 400 错误 → 重置 session 重试一次
+            if reply.startswith("API Error:") and ("thinking" in reply or "400" in reply):
+                logger.warning(f"[主会话] API 错误，重置 session 重试: {reply[:100]}")
+                if status_msg_id:
+                    update_card_message(status_msg_id, "🔄 会话数据异常，正在重置并重试...", get_token(), workspace=main.workspace)
+                pc.session_id = None
+                main.session_id = ""
+                save_session(main.chat_id, "")
+                pc.disconnect()
+                reply, new_session_id, tool_calls = pc.chat_sync(message_with_hint, on_heartbeat=on_heartbeat, on_reconnect=on_reconnect)
+
             if new_session_id != main.session_id:
                 main.session_id = new_session_id
                 save_session(main.chat_id, new_session_id)
@@ -1384,10 +1389,6 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 # 文件消息自带说明文字 → 直接正常分发，无需等待
                 synthetic_text = f"{text}\n\n文件路径: {save_path}"
                 main.log_message("user", f"[{message_type}] {safe_name} -> {save_path}", session_tag="file")
-                # 记录原始 stem 供回传命名
-                with _reply_name_lock:
-                    stem, _ext = os.path.splitext(safe_name)
-                    _expected_reply_basenames[chat_id] = [stem] if stem else []
                 if status_msg_id:
                     update_card_message(status_msg_id, f"📎 已接收文件：{safe_name}，开始处理...", get_token(), workspace=workspace)
                 _route_message(chat_id, synthetic_text, message_id, chat_type)
@@ -1594,6 +1595,34 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         logger.error(f"处理消息失败: {e}")
 
 
+def _start_watchdog(hang_timeout: int = 600) -> None:
+    """启动 watchdog 守护线程。
+
+    连接断开后超过 hang_timeout 秒仍未重连（说明 SDK 卡死），
+    通知飞书后强制以 exit code=1 退出进程，由 Task Scheduler 自动重启。
+    """
+    def _loop():
+        while True:
+            time.sleep(60)
+            with _ws_lock:
+                since = _ws_disconnect_since
+            if since is None:
+                continue
+            elapsed = time.time() - since
+            if elapsed > hang_timeout:
+                logger.error(f"[watchdog] WebSocket 已断线 {elapsed:.0f}s 未重连，强制重启进程")
+                try:
+                    notify_all_chats("🔄 检测到长时间断线，正在自动重启...")
+                except Exception:
+                    pass
+                time.sleep(3)
+                os._exit(1)  # 强制杀死整个进程（含卡死的主线程），由外部守护重启
+
+    t = threading.Thread(target=_loop, daemon=True, name="watchdog")
+    t.start()
+    logger.info(f"[watchdog] 已启动，断线超过 {hang_timeout}s 将强制重启")
+
+
 def _write_pid_file():
     """将当前进程 PID 写入 .pid 文件，供 stop.bat / restart.bat 使用。"""
     pid_file = Path(__file__).parent.parent / ".pid"
@@ -1644,6 +1673,7 @@ def main():
 
     _init_known_claude_pids()   # 记录已存在的 claude.exe（含用户手动开的），不杀
     _cleanup_orphan_claude()    # 只清理父进程已退出的真正孤儿
+    _start_watchdog(hang_timeout=600)  # 断线 10 分钟未重连则强制重启
 
     # 指数退避重连参数
     reconnect_delay = 5    # 初始 5 秒

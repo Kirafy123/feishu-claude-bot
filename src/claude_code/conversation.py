@@ -486,7 +486,7 @@ class PersistentClient:
             else:
                 raise
 
-    def chat_sync(self, message: str, on_heartbeat: Optional[callable] = None) -> tuple[str, str, list[dict]]:
+    def chat_sync(self, message: str, on_heartbeat: Optional[callable] = None, on_reconnect: Optional[callable] = None) -> tuple[str, str, list[dict]]:
         """发送消息并等待回复，session 失效时自动重试"""
         if not self._connected:
             self.connect()
@@ -525,6 +525,12 @@ class PersistentClient:
                 if self.on_session_changed:
                     try:
                         self.on_session_changed(None)
+                    except Exception:
+                        pass
+                # 通知调用方正在重连，让其更新状态卡片
+                if on_reconnect:
+                    try:
+                        on_reconnect()
                     except Exception:
                         pass
                 time.sleep(2)

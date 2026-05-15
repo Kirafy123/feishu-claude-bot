@@ -36,8 +36,13 @@ echo   ^<Settings^>
 echo     ^<MultipleInstancesPolicy^>IgnoreNew^</MultipleInstancesPolicy^>
 echo     ^<DisallowStartIfOnBatteries^>false^</DisallowStartIfOnBatteries^>
 echo     ^<StopIfGoingOnBatteries^>false^</StopIfGoingOnBatteries^>
-echo     ^<AllowHardTerminate^>false^</AllowHardTerminate^>
+echo     ^<AllowHardTerminate^>true^</AllowHardTerminate^>
 echo     ^<StartWhenAvailable^>true^</StartWhenAvailable^>
+echo     ^<ExecutionTimeLimit^>PT0S^</ExecutionTimeLimit^>
+echo     ^<RestartOnFailure^>
+echo       ^<Interval^>PT1M^</Interval^>
+echo       ^<Count^>99^</Count^>
+echo     ^</RestartOnFailure^>
 echo     ^<Enabled^>true^</Enabled^>
 echo   ^</Settings^>
 echo   ^<Actions Context="Author"^>
